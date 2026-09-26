@@ -1,0 +1,19 @@
+{
+  "name": "empatia-care",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A secure, invite-only appointment portal for a medical clinic.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "dev": "NODE_ENV=development node --env-file-if-exists=.env --watch server.js",
+    "create-user": "node --env-file-if-exists=.env scripts/create-user.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3"
+  }
+}
