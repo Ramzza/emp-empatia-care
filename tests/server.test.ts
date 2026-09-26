@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
+import type { AddressInfo } from "node:net";
 
 const testDirectory = mkdtempSync(join(tmpdir(), "empatia-care-"));
 process.env.NODE_ENV = "test";
@@ -14,7 +15,9 @@ const { createUser } = await import("../scripts/create-user.js");
 const server = createAppServer();
 server.listen(0, "127.0.0.1");
 await once(server, "listening");
-const baseUrl = `http://127.0.0.1:${server.address().port}`;
+const address = server.address();
+if (!address || typeof address === "string") throw new Error("The test server did not bind to a TCP port.");
+const baseUrl = `http://127.0.0.1:${(address as AddressInfo).port}`;
 const password = "Correct-Horse-Battery-7!";
 
 await createUser({ role: "doctor", email: "doctor@example.test", name: "Dr. One" }, password);
@@ -22,19 +25,28 @@ await createUser({ role: "doctor", email: "other@example.test", name: "Dr. Two" 
 await createUser({ role: "patient", email: "patient@example.test", name: "Alex Patient", doctor: "doctor@example.test" }, password);
 await createUser({ role: "patient", email: "stranger@example.test", name: "Sam Stranger", doctor: "other@example.test" }, password);
 
-async function login(email) {
+interface TestSession {
+  cookie: string;
+  csrfToken: string;
+  user: { id: string; role: "doctor" | "patient" };
+}
+
+async function login(email: string): Promise<TestSession> {
   const response = await fetch(`${baseUrl}/api/login`, {
     method: "POST",
     headers: { Origin: "http://localhost", "Content-Type": "application/json" },
     body: JSON.stringify({ email, password }),
   });
   assert.equal(response.status, 200);
-  const cookie = response.headers.get("set-cookie").split(";")[0];
+  const cookie = response.headers.get("set-cookie")?.split(";")[0];
+  assert.ok(cookie);
   const session = await fetch(`${baseUrl}/api/session`, { headers: { Cookie: cookie } }).then((r) => r.json());
-  return { cookie, csrfToken: session.csrfToken, user: session.user };
+  assert.ok(typeof session.csrfToken === "string");
+  assert.ok(session.user);
+  return { cookie, csrfToken: session.csrfToken as string, user: session.user as TestSession["user"] };
 }
 
-function nextWeekday() {
+function nextWeekday(): string {
   const date = new Date();
   date.setUTCDate(date.getUTCDate() + 1);
   while (date.getUTCDay() === 0 || date.getUTCDay() === 6) date.setUTCDate(date.getUTCDate() + 1);
@@ -50,8 +62,13 @@ after(() => {
 test("only provisioned patients can book with a linked clinician; clinicians see their own patient schedule", async () => {
   const landing = await fetch(`${baseUrl}/`);
   assert.equal(landing.status, 200);
-  assert.match(landing.headers.get("content-security-policy"), /frame-ancestors 'none'/);
+  const contentSecurityPolicy = landing.headers.get("content-security-policy");
+  assert.ok(contentSecurityPolicy);
+  assert.match(contentSecurityPolicy, /frame-ancestors 'none'/);
   assert.match(await landing.text(), /Centrul Medical Empatia/);
+  const browserApp = await fetch(`${baseUrl}/build/app.js`);
+  assert.equal(browserApp.status, 200);
+  assert.match(await browserApp.text(), /Programările tale/);
 
   const patient = await login("patient@example.test");
   const stranger = await login("stranger@example.test");
@@ -78,6 +95,13 @@ test("only provisioned patients can book with a linked clinician; clinicians see
   assert.equal(availabilityResponse.status, 200);
   const { slots } = await availabilityResponse.json();
   assert.ok(slots.length > 0);
+  const slot = slots[0];
+  assert.ok(slot);
+  const invalidDate = await fetch(
+    `${baseUrl}/api/availability?doctorId=${doctor.user.id}&date=2026-99-99`,
+    { headers: { Cookie: patient.cookie } },
+  );
+  assert.equal(invalidDate.status, 400);
 
   const rejectedOrigin = await fetch(`${baseUrl}/api/appointments`, {
     method: "POST",
@@ -87,7 +111,7 @@ test("only provisioned patients can book with a linked clinician; clinicians see
       "X-CSRF-Token": patient.csrfToken,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slots[0] }),
+    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slot }),
   });
   assert.equal(rejectedOrigin.status, 403);
 
@@ -99,7 +123,7 @@ test("only provisioned patients can book with a linked clinician; clinicians see
       "X-CSRF-Token": patient.csrfToken,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slots[0], website: "spam" }),
+    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slot, website: "spam" }),
   });
   assert.equal(botTrap.status, 403);
 
@@ -111,7 +135,7 @@ test("only provisioned patients can book with a linked clinician; clinicians see
       "X-CSRF-Token": doctor.csrfToken,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slots[0] }),
+    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slot }),
   });
   assert.equal(doctorCannotBook.status, 403);
 
@@ -123,7 +147,7 @@ test("only provisioned patients can book with a linked clinician; clinicians see
       "X-CSRF-Token": stranger.csrfToken,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slots[0] }),
+    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slot }),
   });
   assert.equal(denied.status, 403);
 
@@ -135,7 +159,7 @@ test("only provisioned patients can book with a linked clinician; clinicians see
       "X-CSRF-Token": patient.csrfToken,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slots[0] }),
+    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slot }),
   });
   assert.equal(booking.status, 201);
 

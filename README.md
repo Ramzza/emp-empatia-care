@@ -14,13 +14,16 @@ A responsive clinic website and invite-only appointment portal for Empatia Medic
 
 ## Run locally
 
-Requires Node.js 22.13 or newer.
+Requires Node.js 22.13 or newer. The server, account-provisioning CLI, browser application, and tests are written in strict TypeScript; the build emits server output to `dist/` and the browser bundle to `public/build/app.js`.
 
 ```sh
 npm install
 cp .env.example .env
+npm run build
 npm run dev
 ```
+
+For a production start, run `npm run build` and then `npm start`.
 
 In a second terminal, provision accounts. Passwords are read from a hidden prompt; no public signup or default credentials exist:
 

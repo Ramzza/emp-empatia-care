@@ -1,18 +1,20 @@
 import { randomUUID, scryptSync, randomBytes } from "node:crypto";
-import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { db } from "../server.js";
+import type { AccountRole } from "../server.js";
 
-function argumentsFrom(argv) {
-  const options = {};
+function argumentsFrom(argv: string[]): Record<string, string> {
+  const options: Record<string, string> = {};
   for (let i = 0; i < argv.length; i += 1) {
     const key = argv[i];
-    if (!key.startsWith("--") || !argv[i + 1] || argv[i + 1].startsWith("--")) {
+    const value = argv[i + 1];
+    if (!key?.startsWith("--") || !value || value.startsWith("--")) {
       throw new Error(`Expected --option value; received "${key}".`);
     }
-    options[key.slice(2)] = argv[++i];
+    options[key.slice(2)] = value;
+    i += 1;
   }
   return options;
 }
@@ -45,11 +47,11 @@ async function hiddenPassword() {
   return password;
 }
 
-export async function createUser(options, password) {
+export async function createUser(options: Record<string, string>, password: string): Promise<{ id: string; email: string; role: AccountRole }> {
   const role = options.role;
   const email = options.email?.trim().toLowerCase();
   const name = options.name?.trim();
-  if (!["doctor", "patient"].includes(role)) throw new Error("Role must be doctor or patient.");
+  if (role !== "doctor" && role !== "patient") throw new Error("Role must be doctor or patient.");
   if (!email || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     throw new Error("Provide a valid --email.");
   }
@@ -59,7 +61,7 @@ export async function createUser(options, password) {
   let doctor;
   if (role === "patient") {
     if (!options.doctor) throw new Error("A patient requires --doctor with an existing clinician email.");
-    doctor = db.prepare("SELECT id FROM users WHERE email = ? AND role = 'doctor'").get(options.doctor.trim().toLowerCase());
+    doctor = db.prepare("SELECT id FROM users WHERE email = ? AND role = 'doctor'").get(options.doctor.trim().toLowerCase()) as { id: string } | undefined;
     if (!doctor) throw new Error("That clinician account does not exist.");
   } else if (options.doctor) {
     throw new Error("--doctor is only used when creating a patient.");
@@ -91,7 +93,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const user = await createUser(options, password);
     console.log(`Created ${user.role} account ${user.email}.`);
   } catch (error) {
-    console.error(error.message);
+    console.error(error instanceof Error ? error.message : "Account creation failed.");
     process.exitCode = 1;
   } finally {
     db.close();

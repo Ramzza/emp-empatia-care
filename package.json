@@ -1,5 +1,5 @@
 {
-  "name": "empatia-care",
+  "name": "emp-empatia-care",
   "version": "1.0.0",
   "private": true,
   "description": "A secure, invite-only appointment portal for a medical clinic.",
@@ -8,12 +8,19 @@
     "node": ">=22.13"
   },
   "scripts": {
-    "start": "node --env-file-if-exists=.env server.js",
-    "dev": "NODE_ENV=development node --env-file-if-exists=.env --watch server.js",
-    "create-user": "node --env-file-if-exists=.env scripts/create-user.js",
-    "test": "node --test"
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.browser.json",
+    "start": "node --env-file-if-exists=.env dist/server.js",
+    "dev": "NODE_ENV=development node --env-file-if-exists=.env --watch --import tsx server.ts",
+    "create-user": "node --env-file-if-exists=.env --import tsx scripts/create-user.ts",
+    "test": "npm run build && node --test dist/tests/*.test.js"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.30",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
   }
 }

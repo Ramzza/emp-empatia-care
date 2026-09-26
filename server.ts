@@ -1,11 +1,65 @@
 import { createServer as createHttpServer } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 
-const root = dirname(fileURLToPath(import.meta.url));
+type Role = "doctor" | "patient";
+type JsonObject = Record<string, unknown>;
+export type AccountRole = Role;
+
+interface UserRow {
+  id: string;
+  email: string;
+  name: string;
+  role: Role;
+  salt: string;
+  password_hash: string;
+}
+
+interface SessionRow {
+  token_hash: string;
+  csrf_token: string;
+  expires_at: number;
+  id: string;
+  email: string;
+  name: string;
+  role: Role;
+}
+
+interface DoctorReference {
+  id: string;
+  name: string;
+}
+
+interface AppointmentRow {
+  id: string;
+  starts_at: string;
+  ends_at: string;
+  status: "booked";
+  patient_name: string;
+  doctor_name: string;
+}
+
+interface RateLimitEntry {
+  count: number;
+  resetAt: number;
+}
+
+class HttpError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unknown error";
+}
+
+const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+const root = existsSync(resolve(moduleDirectory, "public")) ? moduleDirectory : resolve(moduleDirectory, "..");
 const production = process.env.NODE_ENV === "production";
 const port = Number(process.env.PORT || 3000);
 const origin = process.env.PUBLIC_ORIGIN || `http://localhost:${port}`;
@@ -23,7 +77,7 @@ const formatter = new Intl.DateTimeFormat("en-GB", {
   minute: "2-digit",
   hourCycle: "h23",
 });
-const rateLimits = new Map();
+const rateLimits = new Map<string, RateLimitEntry>();
 
 if (production) {
   if (!process.env.APP_SECRET || Buffer.byteLength(process.env.APP_SECRET) < 32) {
@@ -81,18 +135,18 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS appointments_doctor_time_idx ON appointments(doctor_id, starts_at);
 `);
 
-export function passwordRecord(password, salt = randomBytes(16).toString("hex")) {
+export function passwordRecord(password: string, salt = randomBytes(16).toString("hex")) {
   const passwordHash = scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 }).toString("hex");
   return { salt, passwordHash };
 }
 
-function safeEqual(left, right) {
+function safeEqual(left: string, right: string): boolean {
   const a = Buffer.from(left);
   const b = Buffer.from(right);
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-function json(res, status, data) {
+function json(res: ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
@@ -101,11 +155,11 @@ function json(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function requestIp(req) {
+function requestIp(req: IncomingMessage): string {
   return req.socket.remoteAddress || "unknown";
 }
 
-function rateLimit(req, key, max, windowMs) {
+function rateLimit(req: IncomingMessage, key: string, max: number, windowMs: number): boolean {
   const ipDigest = createHmac("sha256", appSecret).update(requestIp(req)).digest("hex");
   const bucketKey = `${key}:${ipDigest}`;
   const now = Date.now();
@@ -113,7 +167,11 @@ function rateLimit(req, key, max, windowMs) {
     for (const [candidate, entry] of rateLimits) {
       if (entry.resetAt <= now) rateLimits.delete(candidate);
     }
-    while (rateLimits.size > 5000) rateLimits.delete(rateLimits.keys().next().value);
+    while (rateLimits.size > 5000) {
+      const oldestKey = rateLimits.keys().next().value;
+      if (oldestKey === undefined) break;
+      rateLimits.delete(oldestKey);
+    }
   }
   const previous = rateLimits.get(bucketKey);
   if (!previous || previous.resetAt <= now) {
@@ -124,28 +182,24 @@ function rateLimit(req, key, max, windowMs) {
   return previous.count <= max;
 }
 
-async function readJson(req) {
+async function readJson(req: IncomingMessage): Promise<JsonObject> {
   let body = "";
   for await (const chunk of req) {
     body += chunk;
     if (body.length > 16_384) {
-      const error = new Error("Request body too large.");
-      error.status = 413;
-      throw error;
+      throw new HttpError("Request body too large.", 413);
     }
   }
   try {
-    const value = JSON.parse(body || "{}");
+    const value: unknown = JSON.parse(body || "{}");
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
-    return value;
+    return value as JsonObject;
   } catch {
-    const error = new Error("Invalid JSON request.");
-    error.status = 400;
-    throw error;
+    throw new HttpError("Invalid JSON request.", 400);
   }
 }
 
-function requestCookie(req, name) {
+function requestCookie(req: IncomingMessage, name: string): string {
   const cookies = req.headers.cookie || "";
   for (const part of cookies.split(";")) {
     const [key, ...value] = part.trim().split("=");
@@ -154,22 +208,22 @@ function requestCookie(req, name) {
   return "";
 }
 
-function tokenDigest(token) {
+function tokenDigest(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
-function sessionFor(req) {
+function sessionFor(req: IncomingMessage): SessionRow | null {
   const token = requestCookie(req, cookieName);
   if (!token) return null;
   const session = db.prepare(`
     SELECT s.token_hash, s.csrf_token, s.expires_at, u.id, u.email, u.name, u.role
     FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ? AND s.expires_at > ?
-  `).get(tokenDigest(token), Date.now());
+  `).get(tokenDigest(token), Date.now()) as SessionRow | undefined;
   return session || null;
 }
 
-function requireSession(req, res) {
+function requireSession(req: IncomingMessage, res: ServerResponse): SessionRow | null {
   const session = sessionFor(req);
   if (!session) {
     json(res, 401, { error: "Sign in to continue." });
@@ -178,20 +232,21 @@ function requireSession(req, res) {
   return session;
 }
 
-function validateWrite(req, session = null) {
+function validateWrite(req: IncomingMessage, session: SessionRow | null = null): boolean {
   if (req.headers.origin !== origin) return false;
   if (!session) return true;
   const csrf = req.headers["x-csrf-token"];
   return typeof csrf === "string" && safeEqual(csrf, session.csrf_token);
 }
 
-function parseDate(date) {
+function parseDate(date: string): Date | null {
   if (typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
   const parsed = new Date(`${date}T12:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString().slice(0, 10) === date ? parsed : null;
 }
 
-function localDateTimeToUtc(date, time) {
+function localDateTimeToUtc(date: string, time: string): Date {
   const desired = Date.parse(`${date}T${time}:00.000Z`);
   let guess = desired;
   for (let i = 0; i < 3; i += 1) {
@@ -208,7 +263,7 @@ function localDateTimeToUtc(date, time) {
   return new Date(guess);
 }
 
-export function availableSlots(doctorId, date) {
+export function availableSlots(doctorId: string, date: string): string[] {
   const parsed = parseDate(date);
   if (!parsed || parsed.getUTCDay() === 0 || parsed.getUTCDay() === 6) return [];
   const slots = [];
@@ -218,28 +273,30 @@ export function availableSlots(doctorId, date) {
     const startsAt = localDateTimeToUtc(date, `${hour}:${mins}`);
     if (startsAt.getTime() <= Date.now()) continue;
     const startIso = startsAt.toISOString();
-    const booked = db.prepare("SELECT 1 FROM appointments WHERE doctor_id = ? AND starts_at = ?").get(doctorId, startIso);
+    const booked = db.prepare("SELECT 1 FROM appointments WHERE doctor_id = ? AND starts_at = ?")
+      .get(doctorId, startIso) as { 1: number } | undefined;
     if (!booked) slots.push(startIso);
   }
   return slots;
 }
 
-function linkedDoctor(doctorId, patientId) {
+function linkedDoctor(doctorId: unknown, patientId: string): DoctorReference | undefined {
+  if (typeof doctorId !== "string") return undefined;
   return db.prepare(`
     SELECT u.id, u.name FROM users u
     JOIN doctor_patients dp ON dp.doctor_id = u.id
     WHERE u.id = ? AND dp.patient_id = ? AND u.role = 'doctor'
-  `).get(doctorId, patientId);
+  `).get(doctorId, patientId) as DoctorReference | undefined;
 }
 
-async function verifyTurnstile(token, req) {
+async function verifyTurnstile(token: unknown, req: IncomingMessage): Promise<boolean> {
   if (!production && process.env.NODE_ENV !== "production") return true;
   if (typeof token !== "string" || token.length < 1 || token.length > 2048) return false;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5000);
   try {
     const body = new URLSearchParams({
-      secret: process.env.TURNSTILE_SECRET_KEY,
+      secret: process.env.TURNSTILE_SECRET_KEY ?? "",
       response: token,
       remoteip: requestIp(req),
     });
@@ -250,18 +307,19 @@ async function verifyTurnstile(token, req) {
       signal: controller.signal,
     });
     if (!response.ok) return false;
-    const result = await response.json();
-    return result.success === true &&
-      result.hostname === process.env.TURNSTILE_EXPECTED_HOSTNAME;
+    const result: unknown = await response.json();
+    return typeof result === "object" && result !== null &&
+      "success" in result && result.success === true &&
+      "hostname" in result && result.hostname === process.env.TURNSTILE_EXPECTED_HOSTNAME;
   } catch (error) {
-    if (error.name === "AbortError") return false;
+    if (error instanceof Error && error.name === "AbortError") return false;
     throw error;
   } finally {
     clearTimeout(timeout);
   }
 }
 
-function safeReturnAppointment(row) {
+function safeReturnAppointment(row: AppointmentRow) {
   return {
     id: row.id,
     startsAt: row.starts_at,
@@ -272,7 +330,7 @@ function safeReturnAppointment(row) {
   };
 }
 
-async function handleApi(req, res, url) {
+async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   if (req.method === "GET" && url.pathname === "/api/config") {
     return json(res, 200, { turnstileSiteKey: process.env.TURNSTILE_SITE_KEY || "" });
   }
@@ -286,7 +344,7 @@ async function handleApi(req, res, url) {
     if (typeof body.email !== "string" || typeof body.password !== "string") {
       return json(res, 400, { error: "Enter your email and password." });
     }
-    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(body.email.trim().toLowerCase());
+    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(body.email.trim().toLowerCase()) as UserRow | undefined;
     const candidate = passwordRecord(body.password, user?.salt || "invalid-user-salt");
     if (!user || !safeEqual(candidate.passwordHash, user.password_hash)) {
       return json(res, 401, { error: "Email or password is incorrect." });
@@ -313,12 +371,12 @@ async function handleApi(req, res, url) {
     const session = sessionFor(req);
     if (!session) return json(res, 200, { user: null });
     const user = { id: session.id, email: session.email, name: session.name, role: session.role };
-    const doctors = session.role === "patient"
+    const doctors: DoctorReference[] = session.role === "patient"
       ? db.prepare(`
           SELECT u.id, u.name FROM users u
           JOIN doctor_patients dp ON dp.doctor_id = u.id
           WHERE dp.patient_id = ? ORDER BY u.name
-        `).all(session.id)
+        `).all(session.id) as DoctorReference[]
       : [];
     return json(res, 200, { user, csrfToken: session.csrf_token, doctors });
   }
@@ -344,14 +402,14 @@ async function handleApi(req, res, url) {
           JOIN users d ON d.id = a.doctor_id
           WHERE a.doctor_id = ? AND a.starts_at >= ?
           ORDER BY a.starts_at
-        `).all(session.id, new Date().toISOString())
+        `).all(session.id, new Date().toISOString()) as AppointmentRow[]
       : db.prepare(`
           SELECT a.*, p.name AS patient_name, d.name AS doctor_name
           FROM appointments a JOIN users p ON p.id = a.patient_id
           JOIN users d ON d.id = a.doctor_id
           WHERE a.patient_id = ? AND a.starts_at >= ?
           ORDER BY a.starts_at
-        `).all(session.id, new Date().toISOString());
+        `).all(session.id, new Date().toISOString()) as AppointmentRow[];
     return json(res, 200, { appointments: appointments.map(safeReturnAppointment) });
   }
 
@@ -384,8 +442,10 @@ async function handleApi(req, res, url) {
     if (!(await verifyTurnstile(body.turnstileToken, req))) {
       return json(res, 400, { error: "Complete the bot-protection check and try again." });
     }
-    const validStart = typeof body.startsAt === "string" &&
-      availableSlots(body.doctorId, body.startsAt.slice(0, 10)).includes(body.startsAt);
+    if (typeof body.doctorId !== "string" || typeof body.startsAt !== "string") {
+      return json(res, 400, { error: "Choose a valid appointment time." });
+    }
+    const validStart = availableSlots(body.doctorId, body.startsAt.slice(0, 10)).includes(body.startsAt);
     if (!validStart) return json(res, 409, { error: "That time is unavailable. Choose another slot." });
     const start = new Date(body.startsAt);
     if (Number.isNaN(start.getTime())) return json(res, 400, { error: "Choose a valid appointment time." });
@@ -397,7 +457,7 @@ async function handleApi(req, res, url) {
         VALUES (?, ?, ?, ?, ?, ?)
       `).run(id, body.doctorId, session.id, start.toISOString(), end.toISOString(), new Date().toISOString());
     } catch (error) {
-      if (error.code === "SQLITE_CONSTRAINT_UNIQUE") {
+      if (error instanceof Error && "code" in error && error.code === "SQLITE_CONSTRAINT_UNIQUE") {
         return json(res, 409, { error: "That time was just booked. Choose another slot." });
       }
       throw error;
@@ -408,7 +468,7 @@ async function handleApi(req, res, url) {
   return json(res, 404, { error: "Not found." });
 }
 
-const contentTypes = {
+const contentTypes: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
@@ -429,7 +489,9 @@ export function createAppServer() {
       try {
         content = readFileSync(filePath);
       } catch (error) {
-        if (error.code === "ENOENT" || error.code === "EISDIR") return json(res, 404, { error: "Not found." });
+        if (error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "EISDIR")) {
+          return json(res, 404, { error: "Not found." });
+        }
         throw error;
       }
       res.writeHead(200, {
@@ -446,9 +508,10 @@ export function createAppServer() {
       return res.end(content);
     } catch (error) {
       if (!res.headersSent) {
-        json(res, error.status || 500, { error: error.status ? error.message : "Something went wrong. Please try again." });
+        const status = error instanceof HttpError ? error.status : 500;
+        json(res, status, { error: status < 500 ? errorMessage(error) : "Something went wrong. Please try again." });
       }
-      if (!error.status) console.error("Request failed:", error.message);
+      if (!(error instanceof HttpError)) console.error("Request failed:", errorMessage(error));
     }
   });
 }

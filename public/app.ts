@@ -1,37 +1,94 @@
-const dialog = document.querySelector(".auth-dialog");
-const portal = document.querySelector(".portal");
-const toast = document.querySelector(".toast");
-const state = { user: null, csrfToken: "", doctors: [], selectedSlot: "", turnstileToken: "", turnstileWidget: null, turnstileSiteKey: "" };
-let toastTimer;
-let turnstileScriptPromise;
+interface PortalUser {
+  id: string;
+  email: string;
+  name: string;
+  role: "doctor" | "patient";
+}
 
-const $ = (selector, parent = document) => parent.querySelector(selector);
-const $$ = (selector, parent = document) => [...parent.querySelectorAll(selector)];
+interface Doctor {
+  id: string;
+  name: string;
+}
 
-function showToast(message) {
+interface Appointment {
+  id: string;
+  startsAt: string;
+  endsAt: string;
+  status: string;
+  patientName: string;
+  doctorName: string;
+}
+
+interface TurnstileApi {
+  render(container: string, options: {
+    sitekey: string;
+    theme: "light";
+    callback(token: string): void;
+    "expired-callback"(): void;
+    "error-callback"(): void;
+  }): string;
+  remove(widgetId: string): void;
+  reset(widgetId: string): void;
+}
+
+declare global {
+  interface Window {
+    turnstile?: TurnstileApi;
+  }
+}
+
+const $ = <T extends Element = HTMLElement>(selector: string, parent: ParentNode = document): T => {
+  const element = parent.querySelector<T>(selector);
+  if (!element) throw new Error(`Expected page element "${selector}" to exist.`);
+  return element;
+};
+const $$ = <T extends Element = HTMLElement>(selector: string, parent: ParentNode = document): T[] =>
+  [...parent.querySelectorAll<T>(selector)];
+
+const dialog = $<HTMLDialogElement>(".auth-dialog");
+const portal = $<HTMLElement>(".portal");
+const toast = $<HTMLElement>(".toast");
+const state: {
+  user: PortalUser | null;
+  csrfToken: string;
+  doctors: Doctor[];
+  selectedSlot: string;
+  turnstileToken: string;
+  turnstileWidget: string | null;
+  turnstileSiteKey: string;
+} = { user: null, csrfToken: "", doctors: [], selectedSlot: "", turnstileToken: "", turnstileWidget: null, turnstileSiteKey: "" };
+let toastTimer: ReturnType<typeof setTimeout> | undefined;
+let turnstileScriptPromise: Promise<void> | null = null;
+
+function showToast(message: string): void {
   toast.textContent = message;
   toast.classList.add("visible");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toast.classList.remove("visible"), 3600);
 }
 
-async function api(path, options = {}) {
+async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers || {});
   if (options.body) headers.set("Content-Type", "application/json");
   if (state.csrfToken && options.method && options.method !== "GET") {
     headers.set("X-CSRF-Token", state.csrfToken);
   }
   const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
-  const result = await response.json();
-  if (!response.ok) throw new Error(result.error || "A apărut o eroare. Încearcă din nou.");
-  return result;
+  const result: unknown = await response.json();
+  if (!response.ok) {
+    const message = typeof result === "object" && result !== null && "error" in result && typeof result.error === "string"
+      ? result.error
+      : "A apărut o eroare. Încearcă din nou.";
+    throw new Error(message);
+  }
+  return result as T;
 }
 
-function localToday() {
+function localToday(): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Bucharest" }).format(new Date());
 }
 
-function formatDate(value, options = {}) {
+function formatDate(value: string, options: Intl.DateTimeFormatOptions = {}): string {
   return new Intl.DateTimeFormat("ro-RO", {
     timeZone: "Europe/Bucharest",
     day: "numeric",
@@ -41,7 +98,7 @@ function formatDate(value, options = {}) {
   }).format(new Date(value));
 }
 
-function formatTime(value) {
+function formatTime(value: string): string {
   return new Intl.DateTimeFormat("ro-RO", {
     timeZone: "Europe/Bucharest",
     hour: "2-digit",
@@ -49,13 +106,18 @@ function formatTime(value) {
   }).format(new Date(value));
 }
 
-function escapeText(value) {
+function escapeText(value: string): string {
   return String(value).replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  })[char]);
+  })[char] ?? char);
 }
 
-function makeAppointmentCard(appointment) {
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "A apărut o eroare. Încearcă din nou.";
+}
+
+function makeAppointmentCard(appointment: Appointment): HTMLElement {
+  if (!state.user) throw new Error("A signed-in user is required to render an appointment.");
   const card = document.createElement("article");
   card.className = "appointment-item";
   const initials = appointment.patientName
@@ -75,22 +137,22 @@ function makeAppointmentCard(appointment) {
   return card;
 }
 
-async function loadAppointments() {
+async function loadAppointments(): Promise<void> {
   const list = $("[data-appointments]");
   const empty = $("[data-empty]");
   list.replaceChildren();
   try {
-    const { appointments } = await api("/api/appointments");
+    const { appointments } = await api<{ appointments: Appointment[] }>("/api/appointments");
     $("[data-appointment-count]").textContent = String(appointments.length).padStart(2, "0");
     for (const appointment of appointments) list.append(makeAppointmentCard(appointment));
     empty.hidden = appointments.length !== 0;
   } catch (error) {
-    list.innerHTML = `<p class="muted">${escapeText(error.message)}</p>`;
+    list.innerHTML = `<p class="muted">${escapeText(errorMessage(error))}</p>`;
     empty.hidden = true;
   }
 }
 
-function renderSlots(slots) {
+function renderSlots(slots: string[]): void {
   const target = $("[data-slots]");
   target.replaceChildren();
   state.selectedSlot = "";
@@ -115,26 +177,27 @@ function renderSlots(slots) {
   }
 }
 
-async function loadSlots() {
-  const date = $("#appointment-date").value;
-  const doctorId = $("#doctor").value;
+async function loadSlots(): Promise<void> {
+  const date = $<HTMLInputElement>("#appointment-date").value;
+  const doctorId = $<HTMLSelectElement>("#doctor").value;
   state.selectedSlot = "";
   if (!date || !doctorId) return renderSlots([]);
   $("[data-slots]").textContent = "Se verifică orele disponibile…";
   try {
-    const result = await api(`/api/availability?doctorId=${encodeURIComponent(doctorId)}&date=${encodeURIComponent(date)}`);
+    const result = await api<{ slots: string[] }>(`/api/availability?doctorId=${encodeURIComponent(doctorId)}&date=${encodeURIComponent(date)}`);
     renderSlots(result.slots);
   } catch (error) {
-    $("[data-slots]").textContent = error.message;
+    $("[data-slots]").textContent = errorMessage(error);
   }
 }
 
-function loadTurnstile() {
-  if (!state.turnstileSiteKey || !window.turnstile) return;
-  if (state.turnstileWidget !== null) window.turnstile.remove(state.turnstileWidget);
+function loadTurnstile(): void {
+  const turnstile = window.turnstile;
+  if (!state.turnstileSiteKey || !turnstile) return;
+  if (state.turnstileWidget !== null) turnstile.remove(state.turnstileWidget);
   state.turnstileToken = "";
   $("#turnstile").replaceChildren();
-  state.turnstileWidget = window.turnstile.render("#turnstile", {
+  state.turnstileWidget = turnstile.render("#turnstile", {
     sitekey: state.turnstileSiteKey,
     theme: "light",
     callback: (token) => { state.turnstileToken = token; },
@@ -143,7 +206,7 @@ function loadTurnstile() {
   });
 }
 
-function ensureTurnstile() {
+function ensureTurnstile(): Promise<void> {
   if (window.turnstile) {
     loadTurnstile();
     return Promise.resolve();
@@ -154,16 +217,16 @@ function ensureTurnstile() {
     script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
     script.async = true;
     script.defer = true;
-    script.onload = resolve;
+    script.onload = () => resolve();
     script.onerror = () => reject(new Error("Verificarea de securitate nu este disponibilă."));
     document.head.append(script);
   });
   return turnstileScriptPromise.then(loadTurnstile);
 }
 
-async function loadTurnstileConfig() {
+async function loadTurnstileConfig(): Promise<void> {
   try {
-    const config = await api("/api/config");
+    const config = await api<{ turnstileSiteKey: string }>("/api/config");
     state.turnstileSiteKey = config.turnstileSiteKey;
     if (!state.turnstileSiteKey) return;
     await ensureTurnstile();
@@ -172,7 +235,8 @@ async function loadTurnstileConfig() {
   }
 }
 
-function showPortal() {
+function showPortal(): void {
+  if (!state.user) return;
   dialog.close();
   portal.hidden = false;
   document.body.classList.add("portal-open");
@@ -188,20 +252,20 @@ function showPortal() {
   $("[data-list-label]").textContent = isDoctor ? "AGENDA CABINETULUI" : "SPAȚIUL TĂU PERSONAL";
   $("[data-list-heading]").textContent = isDoctor ? "Pacienți programați" : "Programările tale";
   if (!isDoctor) {
-    const doctorSelect = $("#doctor");
+    const doctorSelect = $<HTMLSelectElement>("#doctor");
     doctorSelect.replaceChildren();
     if (state.doctors.length === 0) {
       const option = new Option("Contactează cabinetul pentru acces", "");
       doctorSelect.add(option);
       doctorSelect.disabled = true;
-      $("#booking-form button[type=submit]").disabled = true;
+      $<HTMLButtonElement>("#booking-form button[type=submit]").disabled = true;
     } else {
       doctorSelect.disabled = false;
-      $("#booking-form button[type=submit]").disabled = false;
+      $<HTMLButtonElement>("#booking-form button[type=submit]").disabled = false;
       for (const doctor of state.doctors) doctorSelect.add(new Option(doctor.name, doctor.id));
     }
-    $("#appointment-date").min = localToday();
-    $("#appointment-date").value = "";
+    $<HTMLInputElement>("#appointment-date").min = localToday();
+    $<HTMLInputElement>("#appointment-date").value = "";
     renderSlots([]);
   }
   loadAppointments();
@@ -227,28 +291,28 @@ document.querySelectorAll("[data-open-login]").forEach((button) => button.addEve
 $(".dialog-close").addEventListener("click", () => dialog.close());
 dialog.addEventListener("click", (event) => { if (event.target === dialog) dialog.close(); });
 
-$("#login-form").addEventListener("submit", async (event) => {
+$("#login-form").addEventListener("submit", async (event: Event) => {
   event.preventDefault();
-  const button = $("#login-form button[type=submit]");
+  const button = $<HTMLButtonElement>("#login-form button[type=submit]");
   const message = $("#login-message");
   message.textContent = "";
   button.disabled = true;
   try {
-    await api("/api/login", {
+    await api<{ user: PortalUser }>("/api/login", {
       method: "POST",
       body: JSON.stringify({
-        email: $("#email").value,
-        password: $("#password").value,
+        email: $<HTMLInputElement>("#email").value,
+        password: $<HTMLInputElement>("#password").value,
       }),
     });
-    const session = await api("/api/session");
+    const session = await api<{ user: PortalUser; csrfToken: string; doctors: Doctor[] }>("/api/session");
     state.user = session.user;
     state.csrfToken = session.csrfToken;
     state.doctors = session.doctors;
-    $("#password").value = "";
+    $<HTMLInputElement>("#password").value = "";
     showPortal();
   } catch (error) {
-    message.textContent = error.message;
+    message.textContent = errorMessage(error);
   } finally {
     button.disabled = false;
   }
@@ -257,10 +321,10 @@ $("#login-form").addEventListener("submit", async (event) => {
 $("#doctor").addEventListener("change", loadSlots);
 $("#appointment-date").addEventListener("change", loadSlots);
 
-$("#booking-form").addEventListener("submit", async (event) => {
+$("#booking-form").addEventListener("submit", async (event: Event) => {
   event.preventDefault();
   const message = $("#booking-message");
-  const button = $("#booking-form button[type=submit]");
+  const button = $<HTMLButtonElement>("#booking-form button[type=submit]");
   message.textContent = "";
   if (!state.selectedSlot) {
     message.textContent = "Alege mai întâi un interval disponibil.";
@@ -268,13 +332,13 @@ $("#booking-form").addEventListener("submit", async (event) => {
   }
   button.disabled = true;
   try {
-    await api("/api/appointments", {
+    await api<{ ok: boolean; id: string }>("/api/appointments", {
       method: "POST",
       body: JSON.stringify({
-        doctorId: $("#doctor").value,
+        doctorId: $<HTMLSelectElement>("#doctor").value,
         startsAt: state.selectedSlot,
         turnstileToken: state.turnstileToken,
-        website: $('input[name="website"]').value,
+        website: $<HTMLInputElement>('input[name="website"]').value,
       }),
     });
     showToast("Programarea ta a fost confirmată.");
@@ -283,7 +347,7 @@ $("#booking-form").addEventListener("submit", async (event) => {
     state.turnstileToken = "";
     await Promise.all([loadSlots(), loadAppointments()]);
   } catch (error) {
-    message.textContent = error.message;
+    message.textContent = errorMessage(error);
     if (window.turnstile && state.turnstileWidget !== null) window.turnstile.reset(state.turnstileWidget);
     state.turnstileToken = "";
   } finally {
@@ -297,7 +361,7 @@ $("[data-logout]").addEventListener("click", async () => {
     hidePortal();
     showToast("Ai ieșit din cont.");
   } catch (error) {
-    showToast(error.message);
+    showToast(errorMessage(error));
   }
 });
 
@@ -314,12 +378,14 @@ $$(".main-nav a").forEach((link) => link.addEventListener("click", () => {
 $$("[data-year]").forEach((element) => { element.textContent = String(new Date().getFullYear()); });
 
 try {
-  const session = await api("/api/session");
+  const session = await api<{ user: PortalUser | null; csrfToken?: string; doctors?: Doctor[] }>("/api/session");
   if (session.user) {
     state.user = session.user;
-    state.csrfToken = session.csrfToken;
-    state.doctors = session.doctors;
+    state.csrfToken = session.csrfToken ?? "";
+    state.doctors = session.doctors ?? [];
   }
 } catch {
   console.error("Could not restore the current session.");
 }
+
+export {};
