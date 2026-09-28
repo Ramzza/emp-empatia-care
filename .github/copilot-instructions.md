@@ -1,0 +1,3 @@
+Read the root `PRD.md` before changing business behavior. Treat it as the source of truth, keep it current, and map every stable requirement ID to executable unit or end-to-end tests run in CI.
+Write or update tests before changing behavior and verify the expected assertion fails against unchanged behavior. If behavior already exists, use a disposable baseline or controlled mutation to prove the test detects a violation; setup, syntax, and missing-tool failures are not red tests.
+Use unit tests for isolated logic and end-to-end tests for user-visible workflows. Never weaken tests or revise requirements to accommodate nonconforming code.
