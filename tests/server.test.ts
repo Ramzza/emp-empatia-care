@@ -53,13 +53,21 @@ function nextWeekday(): string {
   return date.toISOString().slice(0, 10);
 }
 
+function nextSaturday(): string {
+  const date = new Date();
+  date.setUTCHours(0, 0, 0, 0);
+  date.setUTCDate(date.getUTCDate() + 1);
+  while (date.getUTCDay() !== 6) date.setUTCDate(date.getUTCDate() + 1);
+  return date.toISOString().slice(0, 10);
+}
+
 after(() => {
   server.close();
   db.close();
   rmSync(testDirectory, { recursive: true, force: true });
 });
 
-test("only provisioned patients can book with a linked clinician; clinicians see their own patient schedule", async () => {
+test("PRD-001: invite-only accounts; PRD-002: linked weekday slots and booking; PRD-003: private schedules; PRD-004: protected requests", async () => {
   const landing = await fetch(`${baseUrl}/`);
   assert.equal(landing.status, 200);
   const contentSecurityPolicy = landing.headers.get("content-security-policy");
@@ -78,6 +86,13 @@ test("only provisioned patients can book with a linked clinician; clinicians see
   assert.equal(patient.user.role, "patient");
   assert.equal(doctor.user.role, "doctor");
 
+  const unprovisionedLogin = await fetch(`${baseUrl}/api/login`, {
+    method: "POST",
+    headers: { Origin: "http://localhost", "Content-Type": "application/json" },
+    body: JSON.stringify({ email: "unknown@example.test", password }),
+  });
+  assert.equal(unprovisionedLogin.status, 401);
+
   const registration = await fetch(`${baseUrl}/api/register`, { method: "POST" });
   assert.equal(registration.status, 404);
 
@@ -95,6 +110,29 @@ test("only provisioned patients can book with a linked clinician; clinicians see
   assert.equal(availabilityResponse.status, 200);
   const { slots } = await availabilityResponse.json();
   assert.ok(slots.length > 0);
+  const clinicClock = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Europe/Bucharest",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
+  for (const value of slots as string[]) {
+    assert.ok(new Date(value).getTime() > Date.now());
+    const parts = clinicClock.formatToParts(new Date(value));
+    const weekday = parts.find((part) => part.type === "weekday")?.value;
+    const hour = Number(parts.find((part) => part.type === "hour")?.value);
+    const minute = Number(parts.find((part) => part.type === "minute")?.value);
+    assert.ok(["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday ?? ""));
+    assert.ok(hour * 60 + minute >= 9 * 60 && hour * 60 + minute < 17 * 60);
+    assert.equal(minute % 30, 0);
+  }
+  const weekendAvailability = await fetch(
+    `${baseUrl}/api/availability?doctorId=${doctor.user.id}&date=${nextSaturday()}`,
+    { headers: { Cookie: patient.cookie } },
+  );
+  assert.equal(weekendAvailability.status, 200);
+  assert.deepEqual((await weekendAvailability.json()).slots, []);
   const slot = slots[0];
   assert.ok(slot);
   const invalidDate = await fetch(
@@ -114,6 +152,17 @@ test("only provisioned patients can book with a linked clinician; clinicians see
     body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slot }),
   });
   assert.equal(rejectedOrigin.status, 403);
+
+  const missingCsrf = await fetch(`${baseUrl}/api/appointments`, {
+    method: "POST",
+    headers: {
+      Origin: "http://localhost",
+      Cookie: patient.cookie,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slot }),
+  });
+  assert.equal(missingCsrf.status, 403);
 
   const botTrap = await fetch(`${baseUrl}/api/appointments`, {
     method: "POST",

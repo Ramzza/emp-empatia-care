@@ -2,6 +2,8 @@
 
 A responsive clinic website and invite-only appointment portal for Empatia Medical Centre in Târgu Mureș. The public-facing design and copy are original; clinic details reflect the publicly listed services and location.
 
+See [PRD.md](PRD.md) for the product requirements and their test mappings.
+
 ## What it does
 
 - Patients sign in to accounts provisioned by the clinic; there is no public registration.
