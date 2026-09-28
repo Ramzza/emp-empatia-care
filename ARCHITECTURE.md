@@ -11,7 +11,7 @@ Empatia Care is a single-process Node.js application that serves a browser porta
 
 ## Request and data flow
 
-The browser loads the static site and calls the same-origin API. After login, the server returns an HTTP-only session cookie while keeping only its hash in SQLite; the session response supplies a CSRF token for writes. API handlers enforce role and doctor-patient relationship checks before returning appointments or availability. A booking is checked again on the server and persisted only if its slot is still available.
+The browser loads the static site and calls the same-origin API. After login, the server returns an HTTP-only session cookie while keeping only its hash in SQLite; the session response supplies a CSRF token for writes. Appointment reads are scoped to the authenticated doctor or patient, while availability and booking require a patient linked to the selected clinician. A booking is revalidated on the server and persisted only if its slot is still available.
 
 Appointment times are stored as UTC instants. Availability is generated for 30-minute weekday slots from 09:00 to 17:00 in `Europe/Bucharest`. In production, booking also requires successful server-side Cloudflare Turnstile verification.
 
