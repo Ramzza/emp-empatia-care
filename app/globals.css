@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+@theme {
+  --color-paper: #f7f8f5;
+  --color-ink: #1c302b;
+  --color-muted: #71817a;
+  --color-clinic: #315e48;
+  --color-clinic-dark: #234b39;
+  --color-leaf: #91a68b;
+  --font-sans: "Avenir Next", "Segoe UI", Arial, sans-serif;
+}
+
+html { scroll-behavior: smooth; }
+body { min-width: 320px; }
+button, input, select { font: inherit; }
+a, button { -webkit-tap-highlight-color: transparent; }

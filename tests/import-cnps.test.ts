@@ -4,21 +4,24 @@ import { after, test } from "node:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hashCnp as browserHashCnp } from "../public/cnp.js";
+import { hashCnp as browserHashCnp } from "../lib/cnp";
 
 const testDirectory = mkdtempSync(join(tmpdir(), "empatia-cnp-import-"));
-process.env.NODE_ENV = "test";
 process.env.DATABASE_PATH = join(testDirectory, "test.sqlite");
-const { db, initializeDatabase } = await import("../server.js");
-const importerUrl = new URL("../scripts/import-cnps.js", import.meta.url);
+const [{ getDatabase, closeDatabase }, { initializeDatabase }] = await Promise.all([
+  import("../lib/server/database"),
+  import("../lib/server/database/schema"),
+]);
+const db = getDatabase();
+const importerUrl = new URL("../lib/server/csv-import.ts", import.meta.url);
 
 after(() => {
-  db.close();
+  closeDatabase();
   rmSync(testDirectory, { recursive: true, force: true });
 });
 
 test("PRD-001: CSV import stores only distinct CNP hashes and browser hashing uses SHA-256", async () => {
-  assert.ok(existsSync(importerUrl), "The CSV CNP importer must be built.");
+  assert.ok(existsSync(importerUrl), "The CSV CNP importer must exist.");
   const importer = await import(importerUrl.href) as {
     importCnpCsvText(csv: string): number;
     importCnpCsvFile(path: string): number;

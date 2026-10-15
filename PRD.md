@@ -16,3 +16,5 @@ Provide a privacy-minimizing clinic appointment portal. Patients book with a cli
   **Verification:** `tests/server.test.ts` test `PRD-004: only an authenticated admin can list active appointments`.
 - **PRD-005 - Protected requests:** Booking and cancellation writes require same-origin requests, admin writes require CSRF, booking rejects raw-CNP and honeypot submissions, booking attempts are rate-limited, production booking verifies Turnstile, and the portal cannot be framed.
   **Verification:** `tests/server.test.ts` test `PRD-005: booking writes require same-origin, reject raw CNPs, and enforce the honeypot`.
+- **PRD-006 - Web stack and module size:** The portal uses React with the Next.js App Router, strict TypeScript, and Tailwind CSS. Keep each source file to at most 100 non-import lines; add shadcn/ui only when it provides needed components.
+  **Verification:** `tests/replatform.test.ts` checks the framework, styling setup, and source-file line limit.

@@ -1,18 +1,19 @@
 # AGENTS.md
 
 ## Project context
-Empatia Care is a privacy-minimizing clinic booking portal; `server.ts` serves the API and static app, `public/` contains the site and browser portal, `scripts/import-cnps.ts` seeds authorized CNP hashes from CSV, and `tests/` verifies server workflows. See [ARCHITECTURE.md](ARCHITECTURE.md) for request flow and [PRD.md](PRD.md) for requirements.
+Empatia Care is a privacy-minimizing clinic booking portal built with React, Next.js App Router, TypeScript, and Tailwind CSS. `app/` contains pages and API routes, `components/` contains the React UI, `lib/server/` owns server behavior, and `scripts/import-cnps.ts` imports authorized CNP hashes. See [ARCHITECTURE.md](ARCHITECTURE.md) and [PRD.md](PRD.md).
 
 ## Conventions
-- Use Node.js 22.13+ and strict TypeScript ES modules; the server and browser builds use separate TypeScript configs.
-- Keep browser code in `public/`, server/API logic in `server.ts`, and CNP CSV import in `scripts/import-cnps.ts`.
+- Use Node.js 22.13+ and strict TypeScript. Use Next.js App Router route handlers and React components; style with Tailwind CSS.
+- Keep user-visible routes under `app/`, reusable UI under `components/`, and server-only behavior under `lib/server/`.
+- Keep each source file to at most 100 non-import lines. Add shadcn/ui only when needed.
 - Keep SQLite limited to appointments and the CNP-hash allow-list; administrator credentials come from environment configuration.
 
 ## Scripts
-- `npm run build` compiles the server and browser application.
-- `npm test` builds the TypeScript and runs the Node.js tests.
+- `npm run build` builds the Next.js application.
+- `npm test` builds Next.js, type-checks TypeScript, and runs the Node.js tests.
 - `npm run dev` starts the local development server.
-- `npm start` runs the compiled server; build first.
+- `npm start` runs the compiled Next.js server; build first.
 
 ## Constraints
 - Treat `PRD.md` as the requirements source of truth; map behavior changes to executable tests by requirement ID.
