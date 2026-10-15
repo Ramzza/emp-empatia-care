@@ -1,60 +1,48 @@
 # Empatia Care
 
-A responsive clinic website and invite-only appointment portal for Empatia Medical Centre in Târgu Mureș. The public-facing design and copy are original; clinic details reflect the publicly listed services and location.
+A privacy-minimizing clinic website and booking portal for Empatia Medical Centre in Târgu Mureș. It uses React, the Next.js App Router, TypeScript, and Tailwind CSS. See [PRD.md](PRD.md) for product requirements and test mappings, and [ARCHITECTURE.md](ARCHITECTURE.md) for the system design.
 
-See [PRD.md](PRD.md) for the product requirements and their test mappings.
+## Booking and data
 
-## What it does
+- Patients book without creating an account using a clinic-approved CNP, email, clinician, and available appointment slot.
+- The browser hashes the CNP with SHA-256 before sending it to the API. Raw CNPs are not sent or persisted.
+- SQLite stores only CNP hashes in `authorized_patients` and booking data in `appointments`; email is used only for confirmation and cancellation delivery.
+- Confirmation is required before a booking becomes active. The email contains an opaque appointment ID and cancellation link.
+- Clinic administrators sign in with environment-configured credentials and can view future active appointments.
+- Appointment slots are 30 minutes, weekdays from 09:00 to 17:00 Europe/Bucharest time. A CNP can have one active booking.
 
-- Patients sign in to accounts provisioned by the clinic; there is no public registration.
-- A patient can book only with a clinician to whom their account is explicitly linked.
-- The server checks the patient–clinician relationship, appointment slot, session, CSRF token, rate limit and bot challenge before saving a booking.
-- In production, Cloudflare Turnstile is required and verified server-to-server. Booking fails closed when its production configuration is missing or verification fails.
-- Clinicians can sign in to a private schedule showing appointment times and patient names. Patients can see only their own bookings.
-- Passwords use Node's scrypt implementation. Session identifiers are random, stored as hashes, and delivered in HTTP-only, same-site cookies.
-- Appointment slots are 30 minutes, weekdays from 09:00 to 17:00 Europe/Bucharest time.
+**SHA-256 is pseudonymization, not anonymization.** CNPs have a constrained format and hashes may be vulnerable to guessing. Protect the SQLite file and backups, restrict access to the source CSV, and do not commit patient data.
 
 ## Run locally
 
-Requires Node.js 22.13 or newer. The server, account-provisioning CLI, browser application, and tests are written in strict TypeScript; the build emits server output to `dist/` and the browser bundle to `public/build/app.js`.
+Requires Node.js 22.13 or newer.
 
 ```sh
 npm install
 cp .env.example .env
-npm run build
 npm run dev
 ```
 
-For a production start, run `npm run build` and then `npm start`.
+Set `ADMIN_USERNAME` and `ADMIN_PASSWORD` in `.env` and configure SMTP using `MAIL_HOST`, `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD`, and `MAIL_FROM`. For local development, a local SMTP sink such as Mailpit can be used.
 
-In a second terminal, provision accounts. Passwords are read from a hidden prompt; no public signup or default credentials exist:
+Open `http://localhost:3000`. Patients can book from **Programare**; clinic staff can sign in from **Administrator**.
 
-```sh
-npm run create-user -- --role doctor --email doctor@example.test --name "Dr. Demo"
-npm run create-user -- --role patient --email patient@example.test --name "Alex Demo" --doctor doctor@example.test
-```
-
-Open `http://localhost:3000`. Local development permits booking without Turnstile; production does not. The example accounts and clinic details are placeholders and must be reviewed before public use.
-
-## Production configuration
-
-Set `NODE_ENV=production`, a unique `APP_SECRET` of at least 32 random bytes, the public HTTPS `PUBLIC_ORIGIN`, and Turnstile site and secret keys. Set `TURNSTILE_EXPECTED_HOSTNAME` to the exact hostname configured in Cloudflare. Use a persistent, private `DATABASE_PATH`; the process must be able to write to its parent directory. Start with `npm start` behind a TLS-terminating reverse proxy.
-
-The app intentionally does not trust proxy headers for client IPs. Configure edge-level rate limits at the trusted reverse proxy as well; the built-in limit is per application process. SQLite is intended for a single app instance with durable local storage, not horizontally scaled replicas.
-
-Before handling real patient data, the clinic must configure and review its privacy notice, consent, data-retention and deletion procedures, access administration, backups, incident response, and applicable GDPR/health-data obligations. This starter does not provide medical advice, emergency care, or a compliance certification. Do not put symptoms or other clinical notes in appointment forms.
-
-## Security boundaries
-
-- Only staff-provisioned accounts can authenticate. Provision the clinician account before linking patients to it.
-- A clinician cannot see appointments belonging to another clinician; a patient cannot query or book for an unlinked clinician.
-- Only the account owner can see a patient's bookings. Clinician schedule responses include only the linked patient name, booking time and status.
-- Writes require same-origin requests and a per-session CSRF token. Login and booking attempts are rate-limited.
-- Availability is informational; the create-booking transaction rechecks access and slot conflicts before saving.
-- Configure backups and operational monitoring without logging passwords, session cookies, Turnstile tokens or patient appointment details.
-
-## Tests
+Prepare a CSV with a `cnp` column containing one 13-digit CNP per row, then import it:
 
 ```sh
-npm test
+npm run import-cnps -- ./clinic-cnp-list.csv
 ```
+
+The importer hashes source values in memory and writes only hashes to SQLite. It reports counts without printing values and can be run again safely. Keep the source CSV outside the repository.
+
+## Production
+
+Set `NODE_ENV=production`, a unique `APP_SECRET` of at least 32 random bytes, an HTTPS `PUBLIC_ORIGIN`, valid administrator credentials, all SMTP settings, and Cloudflare `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`, and `TURNSTILE_EXPECTED_HOSTNAME`. Set `DATABASE_PATH` to a persistent private location.
+
+SQLite is intended for one app instance with durable local storage, not horizontally scaled replicas. Configure edge-level rate limits at the trusted reverse proxy. The first startup against an old database schema removes legacy account, session, and appointment data that does not meet the privacy requirements.
+
+## Security and tests
+
+Booking and cancellation writes require same-origin checks; admin writes also require CSRF. Booking is rate-limited, honeypot-protected, and verifies Turnstile on the server in production. A nonce-based CSP prevents framing. Do not add patient names, contact details, CNPs, symptoms, or clinical notes to appointments or logs.
+
+Each source file is limited to 100 non-import lines. `npm test` builds the Next.js app, runs TypeScript checks, and executes the PRD-mapped API and Next.js server tests.

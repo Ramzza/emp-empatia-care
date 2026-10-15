@@ -2,24 +2,33 @@
   "name": "emp-empatia-care",
   "version": "1.0.0",
   "private": true,
-  "description": "A secure, invite-only appointment portal for a medical clinic.",
+  "description": "A privacy-minimizing appointment portal for a medical clinic.",
   "type": "module",
   "engines": {
     "node": ">=22.13"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && tsc -p tsconfig.browser.json",
-    "start": "node --env-file-if-exists=.env dist/server.js",
-    "dev": "NODE_ENV=development node --env-file-if-exists=.env --watch --import tsx server.ts",
-    "create-user": "node --env-file-if-exists=.env --import tsx scripts/create-user.ts",
-    "test": "npm run build && node --test dist/tests/*.test.js"
+    "build": "node node_modules/next/dist/bin/next build --webpack",
+    "start": "node node_modules/next/dist/bin/next start --hostname 0.0.0.0",
+    "dev": "node node_modules/next/dist/bin/next dev --webpack --hostname 0.0.0.0",
+    "import-cnps": "node --env-file-if-exists=.env --import tsx scripts/import-cnps.ts",
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
+    "test": "npm run build && npm run typecheck && NODE_ENV=test node --import tsx --test tests/*.test.ts"
   },
   "dependencies": {
-    "better-sqlite3": "^13.0.3"
+    "better-sqlite3": "^13.0.3",
+    "next": "^16.4.1",
+    "nodemailer": "^10.1.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
   },
   "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.15.30",
+    "@types/nodemailer": "^8.0.2",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3"
   }

@@ -1,22 +1,32 @@
 # Architecture
 
-Empatia Care is a single-process Node.js application that serves a browser portal and a same-origin JSON API. TypeScript is compiled separately for the server and browser; SQLite is the only application database.
+Empatia Care is a Next.js App Router application. React renders the clinic site and booking/admin pages, TypeScript is used throughout, and Tailwind CSS provides the interface styles. API route handlers delegate to server-only modules for validation, security, email, scheduling, and SQLite access.
 
 ## Components
 
-- `public/index.html`, `public/style.css`, and `public/app.ts` implement the public site and appointment portal. The browser bundle is emitted to `public/build/app.js`.
-- `server.ts` serves static assets and handles `/api/*` routes. It owns authentication, authorization, appointment availability, booking validation, and persistence.
-- `data/empatia.sqlite` stores users, doctor-patient links, sessions, and appointments. SQLite foreign keys and write-ahead logging are enabled; a unique doctor/start-time constraint prevents duplicate bookings.
-- `scripts/create-user.ts` is the staff-operated account provisioning entry point. It creates clinicians and patients, and links each patient to a clinician.
+- `app/` contains the landing page, portal pages, root layout, and `/api/[...path]` route handler.
+- `components/` contains small React page sections and client forms for booking, administration, and cancellation.
+- `lib/server/` contains API behavior, request security, appointment rules, mail delivery, CSV hashing, and lazy SQLite initialization.
+- `lib/client/` contains browser-safe API helpers; `lib/cnp.ts` hashes CNPs with Web Crypto before a booking request.
+- `scripts/import-cnps.ts` reads an authorized CSV and calls the importer, which stores only hashes.
+- `proxy.ts` applies a per-request nonce-based CSP and common security headers. `instrumentation.ts` validates required production configuration at server startup.
+
+Keep each source file to at most 100 non-import lines. The `PRD-006` test enforces the React/Next.js/TypeScript/Tailwind stack and this limit.
 
 ## Request and data flow
 
-The browser loads the static site and calls the same-origin API. After login, the server returns an HTTP-only session cookie while keeping only its hash in SQLite; the session response supplies a CSRF token for writes. Appointment reads are scoped to the authenticated doctor or patient, while availability and booking require a patient linked to the selected clinician. A booking is revalidated on the server and persisted only if its slot is still available.
+Patients enter a 13-digit CNP in the browser. `lib/cnp.ts` hashes it before `components/booking-form.tsx` submits the hash, email, clinician, time, and Turnstile token to `/api/appointments`. The API checks allow-list membership, availability, uniqueness, request origin, rate limits, the honeypot, and production Turnstile verification before reserving a pending appointment.
 
-Appointment times are stored as UTC instants. Availability is generated for 30-minute weekday slots from 09:00 to 17:00 in `Europe/Bucharest`. In production, booking also requires successful server-side Cloudflare Turnstile verification.
+The confirmation email contains an opaque 256-bit appointment ID and a cancellation link. The appointment is activated only after email delivery succeeds; a delivery failure removes the pending row. Cancellation is a same-origin POST using the ID as a bearer capability.
+
+Administrators authenticate with environment-configured credentials. A signed, HTTP-only cookie stores only a short-lived session and CSRF token; SQLite stores no accounts or sessions. Admin responses include future active appointments without CNP hashes or email addresses.
+
+SQLite contains exactly `authorized_patients` (CNP hashes only) and `appointments`. Partial unique indexes prevent concurrent active bookings for a patient or clinician/time. Legacy schemas are dropped and vacuumed during database initialization.
 
 ## Runtime and boundaries
 
-`npm run build` compiles the server to `dist/` and the browser application to `public/build/`; `npm start` runs the compiled server. Production expects one application instance with durable local SQLite storage, behind a TLS-terminating reverse proxy. SQLite is not configured for horizontally scaled application replicas. Account creation is deliberately separate from public registration.
+`npm run dev` starts Next.js in development. `npm run build` creates the production app and `npm start` serves it. Production uses one app instance with durable local SQLite storage behind a trusted TLS-terminating reverse proxy; rate limits are per process.
 
-Run `npm test` to build the TypeScript and execute the server tests.
+Production requires an HTTPS `PUBLIC_ORIGIN`, `APP_SECRET`, administrator credentials, SMTP configuration, and server-verified Cloudflare Turnstile. Do not log CNPs, CNP hashes, email addresses, appointment IDs, passwords, session cookies, Turnstile tokens, or appointment details.
+
+Run `npm test` to build, type-check, and execute the requirement-mapped tests, including an HTTP smoke test against the production Next.js server.
