@@ -4,19 +4,25 @@ Empatia Care is a single-process Node.js application that serves a browser porta
 
 ## Components
 
-- `public/index.html`, `public/style.css`, and `public/app.ts` implement the public site and appointment portal. The browser bundle is emitted to `public/build/app.js`.
-- `server.ts` serves static assets and handles `/api/*` routes. It owns authentication, authorization, appointment availability, booking validation, and persistence.
-- `data/empatia.sqlite` stores users, doctor-patient links, sessions, and appointments. SQLite foreign keys and write-ahead logging are enabled; a unique doctor/start-time constraint prevents duplicate bookings.
-- `scripts/create-user.ts` is the staff-operated account provisioning entry point. It creates clinicians and patients, and links each patient to a clinician.
+- `public/index.html`, `public/style.css`, `public/app.ts`, and `public/cnp.ts` implement the public website, booking workflow, admin UI, and browser-side SHA-256 CNP hashing. The browser build is emitted to `public/build/`.
+- `server.ts` serves static assets and owns booking validation, slot availability, admin authentication, request security, SQLite persistence, and SMTP confirmation delivery.
+- `scripts/import-cnps.ts` reads a clinic-supplied CSV, hashes each 13-digit CNP in memory, and adds only hashes to the authorization table.
+- `data/empatia.sqlite` contains exactly two application tables: `authorized_patients` stores only CNP hashes; `appointments` stores appointment ID, CNP hash, clinician, time, status, and creation time. Email is not persisted.
 
 ## Request and data flow
 
-The browser loads the static site and calls the same-origin API. After login, the server returns an HTTP-only session cookie while keeping only its hash in SQLite; the session response supplies a CSRF token for writes. Appointment reads are scoped to the authenticated doctor or patient, while availability and booking require a patient linked to the selected clinician. A booking is revalidated on the server and persisted only if its slot is still available.
+The browser validates and hashes the CNP locally with Web Crypto, then sends the hash, email, clinician, selected slot, and bot challenge to the same-origin API. The server verifies that the hash is allow-listed, checks that the slot is still available and the CNP has no other active booking, and inserts a pending appointment. It sends a confirmation email containing the appointment ID and cancellation link; the appointment becomes active only after delivery succeeds. A mail failure removes the pending row.
 
-Appointment times are stored as UTC instants. Availability is generated for 30-minute weekday slots from 09:00 to 17:00 in `Europe/Bucharest`. In production, booking also requires successful server-side Cloudflare Turnstile verification.
+Appointments use 30-minute UTC intervals generated for weekdays from 09:00 to 17:00 in `Europe/Bucharest`. Partial unique indexes prevent concurrent active bookings for the same CNP or clinician/time. Cancellation is a same-origin POST that uses the random 256-bit appointment ID from the email as a bearer capability.
+
+An administrator authenticates with environment-configured credentials. The server keeps only a short-lived, signed admin cookie in the browser; it stores no user accounts or sessions. The admin API returns future active appointment details without CNP hashes or email addresses.
+
+On startup, a legacy database schema is dropped and vacuumed before the new tables are created so former account, session, and appointment personal data is not carried forward.
 
 ## Runtime and boundaries
 
-`npm run build` compiles the server to `dist/` and the browser application to `public/build/`; `npm start` runs the compiled server. Production expects one application instance with durable local SQLite storage, behind a TLS-terminating reverse proxy. SQLite is not configured for horizontally scaled application replicas. Account creation is deliberately separate from public registration.
+`npm run build` compiles the server to `dist/` and the browser application to `public/build/`; `npm start` runs the compiled server. Production expects one application instance with durable local SQLite storage, behind a TLS-terminating reverse proxy. SQLite is not configured for horizontally scaled application replicas.
 
-Run `npm test` to build the TypeScript and execute the server tests.
+Production booking requires server-side Cloudflare Turnstile verification, valid SMTP settings, and environment-configured admin credentials. All writes use same-origin checks; admin writes also use CSRF tokens. Rate limiting is per application process. Do not log CNPs, CNP hashes, email addresses, appointment IDs, session cookies, passwords, or Turnstile tokens.
+
+Run `npm test` to build the TypeScript and execute the server and CSV import tests.

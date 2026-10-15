@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { after, test } from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
@@ -9,41 +10,43 @@ import type { AddressInfo } from "node:net";
 const testDirectory = mkdtempSync(join(tmpdir(), "empatia-care-"));
 process.env.NODE_ENV = "test";
 process.env.PUBLIC_ORIGIN = "http://localhost";
+process.env.APP_SECRET = "test-secret-that-is-long-enough-for-local-testing";
+process.env.ADMIN_USERNAME = "clinic-admin";
+process.env.ADMIN_PASSWORD = "test-admin-password-123";
 process.env.DATABASE_PATH = join(testDirectory, "test.sqlite");
 const { createAppServer, db } = await import("../server.js");
-const { createUser } = await import("../scripts/create-user.js");
-const server = createAppServer();
-server.listen(0, "127.0.0.1");
+const sentEmails: Array<{ to: string; subject: string; text: string }> = [];
+let failEmailDelivery = false;
+const server = createAppServer({
+  sendConfirmationEmail: async (message) => {
+    if (failEmailDelivery) throw new Error("SMTP delivery failed.");
+    sentEmails.push(message);
+  },
+});
+server.listen(0, "0.0.0.0");
 await once(server, "listening");
 const address = server.address();
 if (!address || typeof address === "string") throw new Error("The test server did not bind to a TCP port.");
-const baseUrl = `http://127.0.0.1:${(address as AddressInfo).port}`;
-const password = "Correct-Horse-Battery-7!";
+const serverPort = (address as AddressInfo).port;
+let clientAddress = "127.0.0.1";
+const testCnp = "1234567890123";
+const testEmail = "patient@example.test";
+const importerUrl = new URL("../scripts/import-cnps.js", import.meta.url);
 
-await createUser({ role: "doctor", email: "doctor@example.test", name: "Dr. One" }, password);
-await createUser({ role: "doctor", email: "other@example.test", name: "Dr. Two" }, password);
-await createUser({ role: "patient", email: "patient@example.test", name: "Alex Patient", doctor: "doctor@example.test" }, password);
-await createUser({ role: "patient", email: "stranger@example.test", name: "Sam Stranger", doctor: "other@example.test" }, password);
-
-interface TestSession {
-  cookie: string;
-  csrfToken: string;
-  user: { id: string; role: "doctor" | "patient" };
+function serverUrl(path: string): string {
+  return `http://${clientAddress}:${serverPort}${path}`;
 }
 
-async function login(email: string): Promise<TestSession> {
-  const response = await fetch(`${baseUrl}/api/login`, {
-    method: "POST",
-    headers: { Origin: "http://localhost", "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
-  });
-  assert.equal(response.status, 200);
-  const cookie = response.headers.get("set-cookie")?.split(";")[0];
-  assert.ok(cookie);
-  const session = await fetch(`${baseUrl}/api/session`, { headers: { Cookie: cookie } }).then((r) => r.json());
-  assert.ok(typeof session.csrfToken === "string");
-  assert.ok(session.user);
-  return { cookie, csrfToken: session.csrfToken as string, user: session.user as TestSession["user"] };
+function hashCnp(cnp: string): string {
+  return createHash("sha256").update(cnp).digest("hex");
+}
+
+async function importCnp(cnp: string): Promise<void> {
+  assert.ok(existsSync(importerUrl), "The CSV CNP importer must be built.");
+  const importer = await import(importerUrl.href) as {
+    importCnpCsvText(csv: string): number;
+  };
+  importer.importCnpCsvText(`cnp\n${cnp}\n`);
 }
 
 function nextWeekday(): string {
@@ -61,54 +64,61 @@ function nextSaturday(): string {
   return date.toISOString().slice(0, 10);
 }
 
+async function jsonRequest(path: string, body: unknown, options: {
+  origin?: string;
+  cookie?: string;
+  csrfToken?: string;
+} = {}): Promise<Response> {
+  const headers = new Headers({ "Content-Type": "application/json", Origin: options.origin ?? "http://localhost" });
+  if (options.cookie) headers.set("Cookie", options.cookie);
+  if (options.csrfToken) headers.set("X-CSRF-Token", options.csrfToken);
+  return fetch(serverUrl(path), { method: "POST", headers, body: JSON.stringify(body) });
+}
+
 after(() => {
   server.close();
   db.close();
   rmSync(testDirectory, { recursive: true, force: true });
 });
 
-test("PRD-001: invite-only accounts; PRD-002: linked weekday slots and booking; PRD-003: private schedules; PRD-004: protected requests", async () => {
-  const landing = await fetch(`${baseUrl}/`);
-  assert.equal(landing.status, 200);
-  const contentSecurityPolicy = landing.headers.get("content-security-policy");
-  assert.ok(contentSecurityPolicy);
-  assert.match(contentSecurityPolicy, /frame-ancestors 'none'/);
-  assert.match(await landing.text(), /Centrul Medical Empatia/);
-  const browserApp = await fetch(`${baseUrl}/build/app.js`);
-  assert.equal(browserApp.status, 200);
-  assert.match(await browserApp.text(), /Programările tale/);
-
-  const patient = await login("patient@example.test");
-  const stranger = await login("stranger@example.test");
-  const doctor = await login("doctor@example.test");
-  const otherDoctor = await login("other@example.test");
-
-  assert.equal(patient.user.role, "patient");
-  assert.equal(doctor.user.role, "doctor");
-
-  const unprovisionedLogin = await fetch(`${baseUrl}/api/login`, {
-    method: "POST",
-    headers: { Origin: "http://localhost", "Content-Type": "application/json" },
-    body: JSON.stringify({ email: "unknown@example.test", password }),
-  });
-  assert.equal(unprovisionedLogin.status, 401);
-
-  const registration = await fetch(`${baseUrl}/api/register`, { method: "POST" });
-  assert.equal(registration.status, 404);
-
-  const foreignAvailability = await fetch(
-    `${baseUrl}/api/availability?doctorId=${otherDoctor.user.id}&date=${nextWeekday()}`,
-    { headers: { Cookie: patient.cookie } },
+test("PRD-001: only appointment and hashed-CNP tables remain; the browser hashes CNP locally", async () => {
+  clientAddress = "127.0.0.1";
+  const tables = db.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    ORDER BY name
+  `).all() as Array<{ name: string }>;
+  assert.deepEqual(tables.map((table) => table.name), ["appointments", "authorized_patients"]);
+  const patientColumns = db.pragma("table_info(authorized_patients)") as Array<{ name: string }>;
+  assert.deepEqual(patientColumns.map((column) => column.name), ["cnp_hash"]);
+  const appointmentColumns = db.pragma("table_info(appointments)") as Array<{ name: string }>;
+  assert.deepEqual(
+    appointmentColumns.map((column) => column.name),
+    ["id", "cnp_hash", "doctor_id", "starts_at", "ends_at", "status", "created_at"],
   );
-  assert.equal(foreignAvailability.status, 403);
+  const browserApp = await fetch(serverUrl("/build/app.js")).then((response) => response.text());
+  assert.match(browserApp, /hashCnp/);
+  assert.match(browserApp, /cnpHash/);
+  assert.doesNotMatch(browserApp, /localStorage/);
+  const browserCnp = await fetch(serverUrl("/build/cnp.js"));
+  assert.equal(browserCnp.status, 200);
+  assert.match(await browserCnp.text(), /SHA-256/);
+});
 
-  const date = nextWeekday();
-  const availabilityResponse = await fetch(
-    `${baseUrl}/api/availability?doctorId=${doctor.user.id}&date=${date}`,
-    { headers: { Cookie: patient.cookie } },
+test("PRD-002: CSV-authorized CNP hashes can book one future clinic slot with a required email", async () => {
+  clientAddress = "127.0.0.2";
+  await importCnp(testCnp);
+  const doctorsResponse = await fetch(serverUrl("/api/doctors"));
+  assert.equal(doctorsResponse.status, 200);
+  const { doctors } = await doctorsResponse.json() as { doctors: Array<{ id: string }> };
+  assert.ok(doctors.length > 0);
+  const doctorId = doctors[0]?.id;
+  assert.ok(doctorId);
+  const availability = await fetch(
+    serverUrl(`/api/availability?doctorId=${encodeURIComponent(doctorId)}&date=${nextWeekday()}`),
   );
-  assert.equal(availabilityResponse.status, 200);
-  const { slots } = await availabilityResponse.json();
+  assert.equal(availability.status, 200);
+  const { slots } = await availability.json() as { slots: string[] };
   assert.ok(slots.length > 0);
   const clinicClock = new Intl.DateTimeFormat("en-US", {
     timeZone: "Europe/Bucharest",
@@ -117,7 +127,7 @@ test("PRD-001: invite-only accounts; PRD-002: linked weekday slots and booking; 
     minute: "2-digit",
     hourCycle: "h23",
   });
-  for (const value of slots as string[]) {
+  for (const value of slots) {
     assert.ok(new Date(value).getTime() > Date.now());
     const parts = clinicClock.formatToParts(new Date(value));
     const weekday = parts.find((part) => part.type === "weekday")?.value;
@@ -128,117 +138,237 @@ test("PRD-001: invite-only accounts; PRD-002: linked weekday slots and booking; 
     assert.equal(minute % 30, 0);
   }
   const weekendAvailability = await fetch(
-    `${baseUrl}/api/availability?doctorId=${doctor.user.id}&date=${nextSaturday()}`,
-    { headers: { Cookie: patient.cookie } },
+    serverUrl(`/api/availability?doctorId=${encodeURIComponent(doctorId)}&date=${nextSaturday()}`),
   );
   assert.equal(weekendAvailability.status, 200);
-  assert.deepEqual((await weekendAvailability.json()).slots, []);
-  const slot = slots[0];
-  assert.ok(slot);
+  assert.deepEqual((await weekendAvailability.json() as { slots: string[] }).slots, []);
   const invalidDate = await fetch(
-    `${baseUrl}/api/availability?doctorId=${doctor.user.id}&date=2026-99-99`,
-    { headers: { Cookie: patient.cookie } },
+    serverUrl(`/api/availability?doctorId=${encodeURIComponent(doctorId)}&date=2026-99-99`),
   );
   assert.equal(invalidDate.status, 400);
 
-  const rejectedOrigin = await fetch(`${baseUrl}/api/appointments`, {
-    method: "POST",
-    headers: {
-      Origin: "https://attacker.example",
-      Cookie: patient.cookie,
-      "X-CSRF-Token": patient.csrfToken,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slot }),
+  const unlisted = await jsonRequest("/api/appointments", {
+    cnpHash: hashCnp("1111111111111"),
+    doctorId,
+    startsAt: slots[0],
+    email: testEmail,
   });
+  assert.equal(unlisted.status, 403);
+
+  const booking = await jsonRequest("/api/appointments", {
+    cnpHash: hashCnp(testCnp),
+    doctorId,
+    startsAt: slots[0],
+    email: testEmail,
+  });
+  assert.equal(booking.status, 201);
+  const { id } = await booking.json() as { id: string };
+
+  const slotConflictCnp = "2222222222222";
+  await importCnp(slotConflictCnp);
+  const duplicateForSlot = await jsonRequest("/api/appointments", {
+    cnpHash: hashCnp(slotConflictCnp),
+    doctorId,
+    startsAt: slots[0],
+    email: "another@example.test",
+  });
+  assert.equal(duplicateForSlot.status, 409);
+
+  const duplicateForPatient = await jsonRequest("/api/appointments", {
+    cnpHash: hashCnp(testCnp),
+    doctorId,
+    startsAt: slots[1],
+    email: testEmail,
+  });
+  assert.equal(duplicateForPatient.status, 409);
+
+  const missingEmail = await jsonRequest("/api/appointments", {
+    cnpHash: hashCnp(testCnp),
+    doctorId,
+    startsAt: slots[2],
+  });
+  assert.equal(missingEmail.status, 400);
+
+  const appointmentCount = db.prepare("SELECT COUNT(*) AS count FROM appointments WHERE cnp_hash = ?")
+    .get(hashCnp(testCnp)) as { count: number };
+  assert.equal(appointmentCount.count, 1);
+  const appointmentColumns = db.pragma("table_info(appointments)") as Array<{ name: string }>;
+  assert.equal(appointmentColumns.some((column) => column.name === "email"), false);
+  assert.equal((await jsonRequest(`/api/appointments/${id}/cancel`, {})).status, 200);
+});
+
+test("PRD-003: confirmation email contains the appointment-ID cancellation link; cancellation releases the booking", async () => {
+  clientAddress = "127.0.0.3";
+  const cnp = "9876543210987";
+  await importCnp(cnp);
+  const doctorsResponse = await fetch(serverUrl("/api/doctors"));
+  assert.equal(doctorsResponse.status, 200);
+  const { doctors } = await doctorsResponse.json() as { doctors: Array<{ id: string }> };
+  const doctorId = doctors[0]?.id;
+  assert.ok(doctorId);
+  const date = nextWeekday();
+  const availability = await fetch(
+    serverUrl(`/api/availability?doctorId=${encodeURIComponent(doctorId)}&date=${date}`),
+  ).then((response) => response.json()) as { slots: string[] };
+  const booking = await jsonRequest("/api/appointments", {
+    cnpHash: hashCnp(cnp),
+    doctorId,
+    startsAt: availability.slots[0],
+    email: testEmail,
+  });
+  assert.equal(booking.status, 201);
+  const { id } = await booking.json() as { id: string };
+  assert.match(id, /^[0-9a-f]{64}$/);
+  assert.equal(sentEmails.length, 2);
+  const confirmation = sentEmails[1];
+  assert.equal(confirmation?.to, testEmail);
+  assert.match(confirmation?.text ?? "", new RegExp(encodeURIComponent(id)));
+  assert.match(confirmation?.text ?? "", /cancel/i);
+  assert.doesNotMatch(confirmation?.text ?? "", new RegExp(cnp));
+  assert.doesNotMatch(confirmation?.text ?? "", new RegExp(hashCnp(cnp)));
+
+  const cancellation = await jsonRequest(`/api/appointments/${id}/cancel`, {});
+  assert.equal(cancellation.status, 200);
+  const cancelled = db.prepare("SELECT status FROM appointments WHERE id = ?").get(id) as { status: string };
+  assert.equal(cancelled.status, "cancelled");
+
+  const failedCnp = "9876543210115";
+  await importCnp(failedCnp);
+  const availableAgain = await fetch(
+    serverUrl(`/api/availability?doctorId=${encodeURIComponent(doctorId)}&date=${date}`),
+  ).then((response) => response.json()) as { slots: string[] };
+  failEmailDelivery = true;
+  const failedBooking = await jsonRequest("/api/appointments", {
+    cnpHash: hashCnp(failedCnp),
+    doctorId,
+    startsAt: availableAgain.slots[0],
+    email: "failure@example.test",
+  });
+  failEmailDelivery = false;
+  assert.equal(failedBooking.status, 503);
+  const failedAppointmentCount = db.prepare("SELECT COUNT(*) AS count FROM appointments WHERE cnp_hash = ?")
+    .get(hashCnp(failedCnp)) as { count: number };
+  assert.equal(failedAppointmentCount.count, 0);
+});
+
+test("PRD-004: only an authenticated admin can list active appointments", async () => {
+  clientAddress = "127.0.0.4";
+  const cnp = "9876543210123";
+  await importCnp(cnp);
+  const adminPage = await fetch(serverUrl("/")).then((response) => response.text());
+  assert.match(adminPage, /data-open-admin/);
+  assert.match(adminPage, /data-admin-only/);
+  assert.match(adminPage, /Programări active/);
+  const privateList = await fetch(serverUrl("/api/appointments"));
+  assert.equal(privateList.status, 401);
+
+  const rejectedOrigin = await jsonRequest("/api/admin/login", {
+    username: "clinic-admin",
+    password: "test-admin-password-123",
+  }, { origin: "https://attacker.example" });
   assert.equal(rejectedOrigin.status, 403);
-
-  const missingCsrf = await fetch(`${baseUrl}/api/appointments`, {
-    method: "POST",
-    headers: {
-      Origin: "http://localhost",
-      Cookie: patient.cookie,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slot }),
+  const rejectedPassword = await jsonRequest("/api/admin/login", {
+    username: "clinic-admin",
+    password: "wrong-password-123",
   });
-  assert.equal(missingCsrf.status, 403);
-
-  const botTrap = await fetch(`${baseUrl}/api/appointments`, {
-    method: "POST",
-    headers: {
-      Origin: "http://localhost",
-      Cookie: patient.cookie,
-      "X-CSRF-Token": patient.csrfToken,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slot, website: "spam" }),
+  assert.equal(rejectedPassword.status, 401);
+  const login = await jsonRequest("/api/admin/login", {
+    username: "clinic-admin",
+    password: "test-admin-password-123",
   });
-  assert.equal(botTrap.status, 403);
+  assert.equal(login.status, 200);
+  const cookie = login.headers.get("set-cookie")?.split(";")[0];
+  assert.ok(cookie);
+  const session = await fetch(serverUrl("/api/admin/session"), { headers: { Cookie: cookie } })
+    .then((response) => response.json()) as { csrfToken: string; admin: boolean };
+  assert.equal(session.admin, true);
+  assert.ok(session.csrfToken);
 
-  const doctorCannotBook = await fetch(`${baseUrl}/api/appointments`, {
-    method: "POST",
-    headers: {
-      Origin: "http://localhost",
-      Cookie: doctor.cookie,
-      "X-CSRF-Token": doctor.csrfToken,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slot }),
-  });
-  assert.equal(doctorCannotBook.status, 403);
-
-  const denied = await fetch(`${baseUrl}/api/appointments`, {
-    method: "POST",
-    headers: {
-      Origin: "http://localhost",
-      Cookie: stranger.cookie,
-      "X-CSRF-Token": stranger.csrfToken,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slot }),
-  });
-  assert.equal(denied.status, 403);
-
-  const booking = await fetch(`${baseUrl}/api/appointments`, {
-    method: "POST",
-    headers: {
-      Origin: "http://localhost",
-      Cookie: patient.cookie,
-      "X-CSRF-Token": patient.csrfToken,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slot }),
+  const doctors = await fetch(serverUrl("/api/doctors")).then((response) => response.json()) as {
+    doctors: Array<{ id: string }>;
+  };
+  const doctorId = doctors.doctors[0]?.id;
+  assert.ok(doctorId);
+  const slots = await fetch(
+    serverUrl(`/api/availability?doctorId=${encodeURIComponent(doctorId)}&date=${nextWeekday()}`),
+  ).then((response) => response.json()) as { slots: string[] };
+  const booking = await jsonRequest("/api/appointments", {
+    cnpHash: hashCnp(cnp),
+    doctorId,
+    startsAt: slots.slots[0],
+    email: "admin-view@example.test",
   });
   assert.equal(booking.status, 201);
 
-  const duplicate = await fetch(`${baseUrl}/api/appointments`, {
-    method: "POST",
-    headers: {
-      Origin: "http://localhost",
-      Cookie: patient.cookie,
-      "X-CSRF-Token": patient.csrfToken,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ doctorId: doctor.user.id, startsAt: slots[0] }),
+  const agenda = await fetch(serverUrl("/api/appointments"), { headers: { Cookie: cookie } })
+    .then((response) => response.json()) as { appointments: Array<Record<string, unknown>> };
+  assert.equal(agenda.appointments.length, 1);
+  assert.equal("email" in (agenda.appointments[0] ?? {}), false);
+  assert.equal("cnpHash" in (agenda.appointments[0] ?? {}), false);
+
+  const rejectedLogout = await jsonRequest("/api/admin/logout", {}, { cookie });
+  assert.equal(rejectedLogout.status, 403);
+  const logout = await jsonRequest("/api/admin/logout", {}, {
+    cookie,
+    csrfToken: session.csrfToken,
   });
-  assert.equal(duplicate.status, 409);
+  assert.equal(logout.status, 200);
+  assert.match(logout.headers.get("set-cookie") ?? "", /Max-Age=0/);
+  const loggedOutSession = await fetch(serverUrl("/api/admin/session")).then((response) => response.json()) as {
+    admin: boolean;
+  };
+  assert.equal(loggedOutSession.admin, false);
+});
 
-  const doctorAgenda = await fetch(`${baseUrl}/api/appointments`, { headers: { Cookie: doctor.cookie } })
-    .then((response) => response.json());
-  assert.equal(doctorAgenda.appointments.length, 1);
-  assert.equal(doctorAgenda.appointments[0].patientName, "Alex Patient");
+test("PRD-005: booking writes require same-origin, reject raw CNPs, and enforce the honeypot", async () => {
+  clientAddress = "127.0.0.5";
+  const landing = await fetch(serverUrl("/"));
+  assert.equal(landing.status, 200);
+  assert.match(landing.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+  const foreignOrigin = await jsonRequest("/api/appointments", {
+    cnpHash: hashCnp(testCnp),
+    doctorId: "darko",
+    startsAt: new Date(Date.now() + 86_400_000).toISOString(),
+    email: testEmail,
+  }, { origin: "https://attacker.example" });
+  assert.equal(foreignOrigin.status, 403);
 
-  const patientAgenda = await fetch(`${baseUrl}/api/appointments`, { headers: { Cookie: patient.cookie } })
-    .then((response) => response.json());
-  assert.equal(patientAgenda.appointments.length, 1);
-  assert.equal(patientAgenda.appointments[0].doctorName, "Dr. One");
+  const rawCnp = await jsonRequest("/api/appointments", {
+    cnp: testCnp,
+    doctorId: "darko",
+    startsAt: new Date(Date.now() + 86_400_000).toISOString(),
+    email: testEmail,
+  });
+  assert.equal(rawCnp.status, 400);
 
-  const strangerAgenda = await fetch(`${baseUrl}/api/appointments`, { headers: { Cookie: stranger.cookie } })
-    .then((response) => response.json());
-  assert.equal(strangerAgenda.appointments.length, 0);
+  const unexpectedField = await jsonRequest("/api/appointments", {
+    cnpHash: hashCnp(testCnp),
+    cnpValue: testCnp,
+    doctorId: "darko",
+    startsAt: new Date(Date.now() + 86_400_000).toISOString(),
+    email: testEmail,
+  });
+  assert.equal(unexpectedField.status, 400);
 
-  const otherAgenda = await fetch(`${baseUrl}/api/appointments`, { headers: { Cookie: otherDoctor.cookie } })
-    .then((response) => response.json());
-  assert.equal(otherAgenda.appointments.length, 0);
+  const botTrap = await jsonRequest("/api/appointments", {
+    cnpHash: hashCnp(testCnp),
+    doctorId: "darko",
+    startsAt: new Date(Date.now() + 86_400_000).toISOString(),
+    email: testEmail,
+    website: "spam",
+  });
+  assert.equal(botTrap.status, 403);
+
+  let finalRateLimitedStatus = 0;
+  for (let attempt = 0; attempt < 13; attempt += 1) {
+    const response = await jsonRequest("/api/appointments", {
+      cnpHash: hashCnp(testCnp),
+      doctorId: "darko",
+      startsAt: new Date(Date.now() + 86_400_000).toISOString(),
+      email: testEmail,
+      website: "spam",
+    });
+    finalRateLimitedStatus = response.status;
+  }
+  assert.equal(finalRateLimitedStatus, 429);
 });

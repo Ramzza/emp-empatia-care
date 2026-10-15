@@ -1,3 +1,4 @@
+import { hashCnp } from "./cnp.js";
 const $ = (selector, parent = document) => {
     const element = parent.querySelector(selector);
     if (!element)
@@ -5,10 +6,18 @@ const $ = (selector, parent = document) => {
     return element;
 };
 const $$ = (selector, parent = document) => [...parent.querySelectorAll(selector)];
-const dialog = $(".auth-dialog");
+const adminDialog = $("#admin-dialog");
+const cancelDialog = $("#cancel-dialog");
 const portal = $(".portal");
 const toast = $(".toast");
-const state = { user: null, csrfToken: "", doctors: [], selectedSlot: "", turnstileToken: "", turnstileWidget: null, turnstileSiteKey: "" };
+const state = {
+    csrfToken: "",
+    doctors: [],
+    selectedSlot: "",
+    turnstileToken: "",
+    turnstileWidget: null,
+    turnstileSiteKey: "",
+};
 let toastTimer;
 let turnstileScriptPromise = null;
 function showToast(message) {
@@ -62,24 +71,13 @@ function errorMessage(error) {
     return error instanceof Error ? error.message : "A apărut o eroare. Încearcă din nou.";
 }
 function makeAppointmentCard(appointment) {
-    if (!state.user)
-        throw new Error("A signed-in user is required to render an appointment.");
     const card = document.createElement("article");
     card.className = "appointment-item";
-    const initials = appointment.patientName
-        .split(/\s+/)
-        .map((part) => part[0])
-        .slice(0, 2)
-        .join("")
-        .toLocaleUpperCase("ro-RO");
-    const detail = state.user.role === "doctor"
-        ? `<strong>${escapeText(appointment.patientName)}</strong><span>Pacient · ${escapeText(appointment.doctorName)}</span>`
-        : `<strong>${escapeText(appointment.doctorName)}</strong><span>Consultație · ${escapeText(appointment.patientName)}</span>`;
     card.innerHTML = `
     <div class="appointment-date"><span>${escapeText(formatDate(appointment.startsAt, { weekday: "short" }).replace(".", ""))}</span><strong>${escapeText(new Intl.DateTimeFormat("ro-RO", { timeZone: "Europe/Bucharest", day: "2-digit" }).format(new Date(appointment.startsAt)))}</strong></div>
-    <div class="appointment-details">${detail}</div>
+    <div class="appointment-details"><strong>${escapeText(appointment.doctorName)}</strong><span>Programare activă</span></div>
     <div class="appointment-time">${escapeText(formatTime(appointment.startsAt))}<span>30 min</span></div>
-    <span class="appointment-avatar" aria-hidden="true">${escapeText(initials)}</span>`;
+    <span class="appointment-avatar" aria-hidden="true">✳</span>`;
     return card;
 }
 async function loadAppointments() {
@@ -107,159 +105,197 @@ function renderSlots(slots) {
         message.className = "muted";
         message.textContent = "Nu sunt ore disponibile în această zi. Încearcă altă dată.";
         target.append(message);
-        return;
     }
-    for (const slot of slots) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "slot-button";
-        button.textContent = formatTime(slot);
-        button.addEventListener("click", () => {
-            $$(".slot-button", target).forEach((candidate) => candidate.classList.remove("selected"));
-            button.classList.add("selected");
-            state.selectedSlot = slot;
-        });
-        target.append(button);
+    else {
+        for (const slot of slots) {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "slot-button";
+            button.textContent = formatTime(slot);
+            button.addEventListener("click", () => {
+                $$(".slot-button", target).forEach((candidate) => candidate.classList.remove("selected"));
+                button.classList.add("selected");
+                state.selectedSlot = slot;
+            });
+            target.append(button);
+        }
     }
 }
 async function loadSlots() {
     const date = $("#appointment-date").value;
     const doctorId = $("#doctor").value;
     state.selectedSlot = "";
-    if (!date || !doctorId)
-        return renderSlots([]);
-    $("[data-slots]").textContent = "Se verifică orele disponibile…";
+    if (!date || !doctorId) {
+        renderSlots([]);
+    }
+    else {
+        $("[data-slots]").textContent = "Se verifică orele disponibile…";
+        try {
+            const result = await api(`/api/availability?doctorId=${encodeURIComponent(doctorId)}&date=${encodeURIComponent(date)}`);
+            renderSlots(result.slots);
+        }
+        catch (error) {
+            $("[data-slots]").textContent = errorMessage(error);
+        }
+    }
+}
+async function loadDoctors() {
+    const select = $("#doctor");
+    const button = $("#booking-form button[type=submit]");
+    select.disabled = true;
+    button.disabled = true;
     try {
-        const result = await api(`/api/availability?doctorId=${encodeURIComponent(doctorId)}&date=${encodeURIComponent(date)}`);
-        renderSlots(result.slots);
+        const result = await api("/api/doctors");
+        state.doctors = result.doctors;
+        select.replaceChildren();
+        if (state.doctors.length === 0) {
+            select.add(new Option("Contactează cabinetul pentru acces", ""));
+            $("[data-slots]").textContent = "Nu există medici disponibili pentru programare.";
+        }
+        else {
+            for (const doctor of state.doctors)
+                select.add(new Option(doctor.name, doctor.id));
+            select.disabled = false;
+            button.disabled = false;
+        }
     }
     catch (error) {
-        $("[data-slots]").textContent = errorMessage(error);
+        $("[data-booking-message]").textContent = errorMessage(error);
     }
 }
 function loadTurnstile() {
     const turnstile = window.turnstile;
-    if (!state.turnstileSiteKey || !turnstile)
-        return;
-    if (state.turnstileWidget !== null)
-        turnstile.remove(state.turnstileWidget);
-    state.turnstileToken = "";
-    $("#turnstile").replaceChildren();
-    state.turnstileWidget = turnstile.render("#turnstile", {
-        sitekey: state.turnstileSiteKey,
-        theme: "light",
-        callback: (token) => { state.turnstileToken = token; },
-        "expired-callback": () => { state.turnstileToken = ""; },
-        "error-callback": () => { state.turnstileToken = ""; },
-    });
+    if (state.turnstileSiteKey && turnstile) {
+        if (state.turnstileWidget !== null)
+            turnstile.remove(state.turnstileWidget);
+        state.turnstileToken = "";
+        $("#turnstile").replaceChildren();
+        state.turnstileWidget = turnstile.render("#turnstile", {
+            sitekey: state.turnstileSiteKey,
+            theme: "light",
+            callback: (token) => { state.turnstileToken = token; },
+            "expired-callback": () => { state.turnstileToken = ""; },
+            "error-callback": () => { state.turnstileToken = ""; },
+        });
+    }
 }
 function ensureTurnstile() {
+    let loadPromise;
     if (window.turnstile) {
         loadTurnstile();
-        return Promise.resolve();
+        loadPromise = Promise.resolve();
     }
-    if (turnstileScriptPromise)
-        return turnstileScriptPromise.then(loadTurnstile);
-    turnstileScriptPromise = new Promise((resolve, reject) => {
-        const script = document.createElement("script");
-        script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
-        script.async = true;
-        script.defer = true;
-        script.onload = () => resolve();
-        script.onerror = () => reject(new Error("Verificarea de securitate nu este disponibilă."));
-        document.head.append(script);
-    });
-    return turnstileScriptPromise.then(loadTurnstile);
+    else if (turnstileScriptPromise) {
+        loadPromise = turnstileScriptPromise.then(loadTurnstile);
+    }
+    else {
+        turnstileScriptPromise = new Promise((resolve, reject) => {
+            const script = document.createElement("script");
+            script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+            script.async = true;
+            script.defer = true;
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error("Verificarea de securitate nu este disponibilă."));
+            document.head.append(script);
+        });
+        loadPromise = turnstileScriptPromise.then(loadTurnstile);
+    }
+    return loadPromise;
 }
 async function loadTurnstileConfig() {
     try {
         const config = await api("/api/config");
         state.turnstileSiteKey = config.turnstileSiteKey;
-        if (!state.turnstileSiteKey)
-            return;
-        await ensureTurnstile();
+        if (state.turnstileSiteKey)
+            await ensureTurnstile();
     }
     catch {
-        $("#booking-message").textContent = "Verificarea de securitate nu este disponibilă. Te rugăm să încerci din nou mai târziu.";
+        $("[data-booking-message]").textContent = "Verificarea de securitate nu este disponibilă. Încearcă din nou mai târziu.";
     }
 }
-function showPortal() {
-    if (!state.user)
-        return;
-    dialog.close();
+function showBookingPortal() {
+    adminDialog.close();
     portal.hidden = false;
     document.body.classList.add("portal-open");
-    const isDoctor = state.user.role === "doctor";
-    $(".portal-grid").classList.toggle("doctor-grid", isDoctor);
-    $("[data-user-name]").textContent = state.user.name;
-    $("[data-avatar]").textContent = state.user.name.split(/\s+/).map((part) => part[0]).slice(0, 2).join("").toLocaleUpperCase("ro-RO");
-    $("[data-portal-heading]").textContent = isDoctor ? `Bună ziua, ${state.user.name}` : `Bun venit, ${state.user.name}`;
-    $("[data-portal-intro]").textContent = isDoctor
-        ? "Iată programările viitoare din agenda cabinetului."
-        : "Alege medicul și un moment potrivit pentru tine.";
-    $$("[data-patient-only]").forEach((element) => { element.hidden = isDoctor; });
-    $("[data-list-label]").textContent = isDoctor ? "AGENDA CABINETULUI" : "SPAȚIUL TĂU PERSONAL";
-    $("[data-list-heading]").textContent = isDoctor ? "Pacienți programați" : "Programările tale";
-    if (!isDoctor) {
-        const doctorSelect = $("#doctor");
-        doctorSelect.replaceChildren();
-        if (state.doctors.length === 0) {
-            const option = new Option("Contactează cabinetul pentru acces", "");
-            doctorSelect.add(option);
-            doctorSelect.disabled = true;
-            $("#booking-form button[type=submit]").disabled = true;
-        }
-        else {
-            doctorSelect.disabled = false;
-            $("#booking-form button[type=submit]").disabled = false;
-            for (const doctor of state.doctors)
-                doctorSelect.add(new Option(doctor.name, doctor.id));
-        }
-        $("#appointment-date").min = localToday();
-        $("#appointment-date").value = "";
-        renderSlots([]);
-    }
+    state.csrfToken = "";
+    $("[data-booking-only]").hidden = false;
+    $("[data-admin-only]").hidden = true;
+    $("[data-admin-controls]").hidden = true;
+    $(".portal-grid").classList.remove("admin-grid");
+    $(".portal-grid").classList.add("booking-grid");
+    $("[data-portal-label]").textContent = "PROGRAMARE ONLINE";
+    $("[data-portal-heading]").textContent = "Alege programarea.";
+    $("[data-portal-intro]").textContent = "Introdu CNP-ul înregistrat la clinică, datele de contact și intervalul preferat.";
+    $("#booking-message").textContent = "";
+    $("#appointment-date").min = localToday();
+    $("#appointment-date").value = "";
+    $("#cnp").value = "";
+    $("#booking-email").value = "";
+    renderSlots([]);
+    void loadDoctors();
+    void loadTurnstileConfig();
+}
+function showAdminPortal() {
+    adminDialog.close();
+    portal.hidden = false;
+    document.body.classList.add("portal-open");
+    $("[data-booking-only]").hidden = true;
+    $("[data-admin-only]").hidden = false;
+    $("[data-admin-controls]").hidden = false;
+    $(".portal-grid").classList.remove("booking-grid");
+    $(".portal-grid").classList.add("admin-grid");
+    $("[data-portal-label]").textContent = "ADMINISTRARE";
+    $("[data-portal-heading]").textContent = "Programări active";
+    $("[data-portal-intro]").textContent = "Agenda cu toate programările viitoare confirmate.";
     loadAppointments();
-    if (!isDoctor)
-        loadTurnstileConfig();
 }
 function hidePortal() {
     portal.hidden = true;
     document.body.classList.remove("portal-open");
-    state.user = null;
     state.csrfToken = "";
+    $("#cnp").value = "";
+    $("#booking-email").value = "";
+    $("#password").value = "";
+    $("#admin-username").value = "";
 }
-document.querySelectorAll("[data-open-login]").forEach((button) => button.addEventListener("click", async () => {
-    if (state.user) {
-        showPortal();
-        return;
-    }
-    $("#login-message").textContent = "";
-    dialog.showModal();
-}));
-$(".dialog-close").addEventListener("click", () => dialog.close());
-dialog.addEventListener("click", (event) => { if (event.target === dialog)
-    dialog.close(); });
-$("#login-form").addEventListener("submit", async (event) => {
+$$("[data-open-booking]").forEach((button) => {
+    button.addEventListener("click", showBookingPortal);
+});
+$$("[data-open-admin]").forEach((button) => {
+    button.addEventListener("click", () => {
+        $("#admin-login-message").textContent = "";
+        adminDialog.showModal();
+    });
+});
+$(".dialog-close").addEventListener("click", () => adminDialog.close());
+adminDialog.addEventListener("click", (event) => {
+    if (event.target === adminDialog)
+        adminDialog.close();
+});
+adminDialog.addEventListener("close", () => {
+    $("#admin-username").value = "";
+    $("#password").value = "";
+});
+$("#admin-login-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const button = $("#login-form button[type=submit]");
-    const message = $("#login-message");
+    const button = $("#admin-login-form button[type=submit]");
+    const message = $("#admin-login-message");
     message.textContent = "";
     button.disabled = true;
     try {
-        await api("/api/login", {
+        await api("/api/admin/login", {
             method: "POST",
             body: JSON.stringify({
-                email: $("#email").value,
+                username: $("#admin-username").value,
                 password: $("#password").value,
             }),
         });
-        const session = await api("/api/session");
-        state.user = session.user;
+        const session = await api("/api/admin/session");
+        if (!session.admin || !session.csrfToken)
+            throw new Error("Administrator access could not be verified.");
         state.csrfToken = session.csrfToken;
-        state.doctors = session.doctors;
         $("#password").value = "";
-        showPortal();
+        showAdminPortal();
     }
     catch (error) {
         message.textContent = errorMessage(error);
@@ -268,8 +304,8 @@ $("#login-form").addEventListener("submit", async (event) => {
         button.disabled = false;
     }
 });
-$("#doctor").addEventListener("change", loadSlots);
-$("#appointment-date").addEventListener("change", loadSlots);
+$("#doctor").addEventListener("change", () => { void loadSlots(); });
+$("#appointment-date").addEventListener("change", () => { void loadSlots(); });
 $("#booking-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const message = $("#booking-message");
@@ -277,39 +313,45 @@ $("#booking-form").addEventListener("submit", async (event) => {
     message.textContent = "";
     if (!state.selectedSlot) {
         message.textContent = "Alege mai întâi un interval disponibil.";
-        return;
     }
-    button.disabled = true;
-    try {
-        await api("/api/appointments", {
-            method: "POST",
-            body: JSON.stringify({
-                doctorId: $("#doctor").value,
-                startsAt: state.selectedSlot,
-                turnstileToken: state.turnstileToken,
-                website: $('input[name="website"]').value,
-            }),
-        });
-        showToast("Programarea ta a fost confirmată.");
-        state.selectedSlot = "";
-        if (window.turnstile && state.turnstileWidget !== null)
-            window.turnstile.reset(state.turnstileWidget);
-        state.turnstileToken = "";
-        await Promise.all([loadSlots(), loadAppointments()]);
-    }
-    catch (error) {
-        message.textContent = errorMessage(error);
-        if (window.turnstile && state.turnstileWidget !== null)
-            window.turnstile.reset(state.turnstileWidget);
-        state.turnstileToken = "";
-    }
-    finally {
-        button.disabled = false;
+    else {
+        button.disabled = true;
+        try {
+            const cnpHash = await hashCnp($("#cnp").value);
+            await api("/api/appointments", {
+                method: "POST",
+                body: JSON.stringify({
+                    cnpHash,
+                    email: $("#booking-email").value.trim(),
+                    doctorId: $("#doctor").value,
+                    startsAt: state.selectedSlot,
+                    turnstileToken: state.turnstileToken,
+                    website: $('input[name="website"]').value,
+                }),
+            });
+            $("#cnp").value = "";
+            $("#booking-email").value = "";
+            showToast("Programarea este confirmată. Verifică e-mailul pentru detalii și anulare.");
+            state.selectedSlot = "";
+            if (window.turnstile && state.turnstileWidget !== null)
+                window.turnstile.reset(state.turnstileWidget);
+            state.turnstileToken = "";
+            await loadSlots();
+        }
+        catch (error) {
+            message.textContent = errorMessage(error);
+            if (window.turnstile && state.turnstileWidget !== null)
+                window.turnstile.reset(state.turnstileWidget);
+            state.turnstileToken = "";
+        }
+        finally {
+            button.disabled = false;
+        }
     }
 });
 $("[data-logout]").addEventListener("click", async () => {
     try {
-        await api("/api/logout", { method: "POST", body: "{}" });
+        await api("/api/admin/logout", { method: "POST", body: "{}" });
         hidePortal();
         showToast("Ai ieșit din cont.");
     }
@@ -317,6 +359,34 @@ $("[data-logout]").addEventListener("click", async () => {
         showToast(errorMessage(error));
     }
 });
+$("#cancel-confirm").addEventListener("click", async () => {
+    const appointmentId = new URLSearchParams(window.location.search).get("cancel") || "";
+    const message = $("#cancel-message");
+    const button = $("#cancel-confirm");
+    message.textContent = "";
+    button.disabled = true;
+    try {
+        await api(`/api/appointments/${encodeURIComponent(appointmentId)}/cancel`, {
+            method: "POST",
+            body: "{}",
+        });
+        message.textContent = "Programarea a fost anulată.";
+        history.replaceState(null, "", `${window.location.pathname}${window.location.hash}`);
+    }
+    catch (error) {
+        message.textContent = errorMessage(error);
+    }
+});
+$(".cancel-close").addEventListener("click", () => cancelDialog.close());
+const cancelId = new URLSearchParams(window.location.search).get("cancel");
+if (cancelId) {
+    cancelDialog.showModal();
+    const validCancelId = /^[0-9a-f]{64}$/.test(cancelId);
+    if (!validCancelId) {
+        $("#cancel-message").textContent = "Linkul de anulare nu este valid.";
+        $("#cancel-confirm").disabled = true;
+    }
+}
 const menuToggle = $(".menu-toggle");
 menuToggle.addEventListener("click", () => {
     const isOpen = menuToggle.getAttribute("aria-expanded") === "true";
@@ -329,14 +399,12 @@ $$(".main-nav a").forEach((link) => link.addEventListener("click", () => {
 }));
 $$("[data-year]").forEach((element) => { element.textContent = String(new Date().getFullYear()); });
 try {
-    const session = await api("/api/session");
-    if (session.user) {
-        state.user = session.user;
-        state.csrfToken = session.csrfToken ?? "";
-        state.doctors = session.doctors ?? [];
+    const session = await api("/api/admin/session");
+    if (session.admin && session.csrfToken) {
+        state.csrfToken = session.csrfToken;
+        showAdminPortal();
     }
 }
 catch {
-    console.error("Could not restore the current session.");
+    console.error("Could not restore the current admin session.");
 }
-export {};

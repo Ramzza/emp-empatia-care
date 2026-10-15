@@ -1,57 +1,62 @@
 # Empatia Care
 
-A responsive clinic website and invite-only appointment portal for Empatia Medical Centre in Târgu Mureș. The public-facing design and copy are original; clinic details reflect the publicly listed services and location.
+A responsive clinic website and privacy-minimizing appointment portal for Empatia Medical Centre in Târgu Mureș. See [PRD.md](PRD.md) for the business requirements and test mappings, and [ARCHITECTURE.md](ARCHITECTURE.md) for the system design.
 
-See [PRD.md](PRD.md) for the product requirements and their test mappings.
+## Booking and data
 
-## What it does
+- Patients enter their CNP and email address, choose a clinician and an available slot, and book without creating an account.
+- The browser hashes the 13-digit CNP with SHA-256 before sending the booking request. Raw CNPs are not sent to the booking API or persisted.
+- Staff import the clinic's approved CNP list from a CSV. SQLite stores only CNP hashes in `authorized_patients` and the booking data in `appointments`; the appointment's email is not persisted.
+- A confirmation email includes the appointment ID and a cancellation link. Email delivery is required before a booking is confirmed; a delivery failure does not leave a saved appointment.
+- An administrator configured with environment credentials can view all future active appointments. Admin credentials and sessions are not stored in SQLite.
+- Appointment slots are 30 minutes, weekdays from 09:00 to 17:00 Europe/Bucharest time. A CNP can have one active appointment at a time.
 
-- Patients sign in to accounts provisioned by the clinic; there is no public registration.
-- A patient can book only with a clinician to whom their account is explicitly linked.
-- The server checks the patient–clinician relationship, appointment slot, session, CSRF token, rate limit and bot challenge before saving a booking.
-- In production, Cloudflare Turnstile is required and verified server-to-server. Booking fails closed when its production configuration is missing or verification fails.
-- Clinicians can sign in to a private schedule showing appointment times and patient names. Patients can see only their own bookings.
-- Passwords use Node's scrypt implementation. Session identifiers are random, stored as hashes, and delivered in HTTP-only, same-site cookies.
-- Appointment slots are 30 minutes, weekdays from 09:00 to 17:00 Europe/Bucharest time.
+**SHA-256 is pseudonymization, not anonymization.** CNPs have a constrained format and hashes may be vulnerable to guessing. Protect the SQLite file and backups as sensitive data, restrict access to the CSV, and do not commit patient data.
 
 ## Run locally
 
-Requires Node.js 22.13 or newer. The server, account-provisioning CLI, browser application, and tests are written in strict TypeScript; the build emits server output to `dist/` and the browser bundle to `public/build/app.js`.
+Requires Node.js 22.13 or newer.
 
 ```sh
 npm install
 cp .env.example .env
+```
+
+Set `ADMIN_USERNAME` and `ADMIN_PASSWORD` in `.env` (at least 12 characters for the password) and configure an SMTP server using `MAIL_HOST`, `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD`, and `MAIL_FROM`. Booking cannot be confirmed unless the email can be delivered. For local development, a local SMTP sink such as Mailpit can be used.
+
+Build and start the app:
+
+```sh
 npm run build
 npm run dev
 ```
 
-For a production start, run `npm run build` and then `npm start`.
-
-In a second terminal, provision accounts. Passwords are read from a hidden prompt; no public signup or default credentials exist:
+Prepare a CSV with a `cnp` column containing one 13-digit CNP per row, then import it:
 
 ```sh
-npm run create-user -- --role doctor --email doctor@example.test --name "Dr. Demo"
-npm run create-user -- --role patient --email patient@example.test --name "Alex Demo" --doctor doctor@example.test
+npm run import-cnps -- ./clinic-cnp-list.csv
 ```
 
-Open `http://localhost:3000`. Local development permits booking without Turnstile; production does not. The example accounts and clinic details are placeholders and must be reviewed before public use.
+The importer keeps raw CNPs in memory only, writes their SHA-256 hashes, reports counts without printing values, and can be run again safely. Keep the source CSV outside the repository and delete it according to the clinic's retention procedures.
+
+Open `http://localhost:3000`. Patients can book from the public site. Clinic staff can sign in from the **Administrator** link.
 
 ## Production configuration
 
-Set `NODE_ENV=production`, a unique `APP_SECRET` of at least 32 random bytes, the public HTTPS `PUBLIC_ORIGIN`, and Turnstile site and secret keys. Set `TURNSTILE_EXPECTED_HOSTNAME` to the exact hostname configured in Cloudflare. Use a persistent, private `DATABASE_PATH`; the process must be able to write to its parent directory. Start with `npm start` behind a TLS-terminating reverse proxy.
+Set `NODE_ENV=production`, a unique `APP_SECRET` of at least 32 random bytes, an HTTPS `PUBLIC_ORIGIN`, `ADMIN_USERNAME`, `ADMIN_PASSWORD` (at least 12 characters), and the SMTP settings listed above. Production booking also requires Cloudflare `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`, and the exact `TURNSTILE_EXPECTED_HOSTNAME`. Use a persistent, private `DATABASE_PATH` behind a TLS-terminating reverse proxy.
 
-The app intentionally does not trust proxy headers for client IPs. Configure edge-level rate limits at the trusted reverse proxy as well; the built-in limit is per application process. SQLite is intended for a single app instance with durable local storage, not horizontally scaled replicas.
+SQLite is intended for a single app instance with durable local storage, not horizontally scaled replicas. Configure edge-level rate limits at the trusted reverse proxy; the built-in limits are per process.
 
-Before handling real patient data, the clinic must configure and review its privacy notice, consent, data-retention and deletion procedures, access administration, backups, incident response, and applicable GDPR/health-data obligations. This starter does not provide medical advice, emergency care, or a compliance certification. Do not put symptoms or other clinical notes in appointment forms.
+The first startup against the previous database schema drops its user, clinician-link, session, and legacy appointment tables, then vacuums the database. This intentionally removes records that do not meet the new data-minimization requirements; export or retain any records separately only if required by clinic policy and applicable law.
 
-## Security boundaries
+## Security and privacy boundaries
 
-- Only staff-provisioned accounts can authenticate. Provision the clinician account before linking patients to it.
-- A clinician cannot see appointments belonging to another clinician; a patient cannot query or book for an unlinked clinician.
-- Only the account owner can see a patient's bookings. Clinician schedule responses include only the linked patient name, booking time and status.
-- Writes require same-origin requests and a per-session CSRF token. Login and booking attempts are rate-limited.
-- Availability is informational; the create-booking transaction rechecks access and slot conflicts before saving.
-- Configure backups and operational monitoring without logging passwords, session cookies, Turnstile tokens or patient appointment details.
+- CNP allow-list membership and booking uniqueness are checked on the server; SQLite also enforces one active appointment per CNP and per clinician/time.
+- The email address is used only to send the confirmation and cancellation link. It is not placed in SQLite, admin responses, or application logs.
+- Cancellation uses a random 256-bit appointment ID as a bearer capability and requires a same-origin POST after the patient confirms the action.
+- Admin authentication uses an environment-configured password and a signed, HTTP-only, same-site cookie; no admin identity or session is persisted.
+- Booking writes are same-origin checked, rate-limited, honeypot-protected, and require server-verified Turnstile in production. The site cannot be framed.
+- Do not add patient names, contact details, CNPs, symptoms, or clinical notes to appointments or logs.
 
 ## Tests
 
